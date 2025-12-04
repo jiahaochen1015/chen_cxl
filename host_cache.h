@@ -122,7 +122,7 @@
 #define NUM_PREFETCH_THREADS 1
 
 // 定义并发*完成* I/O 的线程数量
-#define NUM_COMPLETION_THREADS 0
+#define NUM_COMPLETION_THREADS 1
 // DEBUG
 // #define DEBUG 1
 #define PREFETCH_DEBUG 1
@@ -162,7 +162,9 @@
 
 /* Data Structures Constants */
 #define GPU_OPEN_FILE_TABLE_SIZE 128
-#define GPU_RW_SIZE 8192
+#define GPU_RW_SIZE_DEMAND (8ULL << 10)
+#define GPU_RW_SIZE_PREFETCH (128ULL << 10)
+#define GPU_RW_SIZE GPU_RW_SIZE_DEMAND
 #define FILENAME_SIZE 128
 
 /* Memory Pool Constants */
@@ -526,20 +528,31 @@ public:
     /* Called by Host */
     __host__ void init() volatile;
 };
-
-class GpuRwQueue
+template <uint32_t Q_SIZE>
+class GpuRwQueueT
 {
 public:
-    GpuRwQueueEntry entries[GPU_RW_SIZE];
-    void *valid_in_pc[GPU_RW_SIZE];
-    __device__ GpuRwQueueEntry *getEntryByIndex(int entry_index);
-    __host__ void init() volatile;
+    GpuRwQueueEntry entries[Q_SIZE];
+    void *valid_in_pc[Q_SIZE];
+    __device__ GpuRwQueueEntry *getEntryByIndex(int entry_index) volatile
+    {
+        return &entries[entry_index];
+    }
+    __host__ void init() volatile
+    {
+        for (int i = 0; i < Q_SIZE; i++)
+        {
+            // entries[i]->init();
+            entries[i].init();
+            valid_in_pc[i] = malloc(DIV_ROUND_UP(64 * 1024 * 1024, 4096));
+        }
+    }
 };
-
-class GpuFileRwManager
+template <uint32_t Q_SIZE>
+class GpuFileRwManagerT
 {
 public:
-    volatile int entry_lock[GPU_RW_SIZE];
+    volatile int entry_lock[Q_SIZE];
     volatile int lock;
     volatile void *buffer_base;
 
@@ -547,18 +560,88 @@ public:
     uint8_t pad6[28];
 
     /* Requests queue */
-    GpuRwQueue *gpu_rw_queue;
+    GpuRwQueueT<Q_SIZE> *gpu_rw_queue;
 
-    __device__ void *getBufferBase() volatile;
-    __device__ int getRWQueueEntry() volatile;
-    __device__ int getRWQueueEntry2() volatile;
-    __device__ int getRWQueueEntry2_nonblocking(int &entry_index) volatile;
+    __device__ void *getBufferBase() volatile
+    {
+        return (void *)buffer_base;
+    }
+    __device__ int getRWQueueEntry() volatile
+    {
+        uint32_t i = (blockIdx.x * blockDim.x + threadIdx.x) & (Q_SIZE - 1);
+        uint32_t ns = 2;
+        do
+        {
+            if (atomicExch((int *)&entry_lock[i], GPU_LOCKED) == GPU_NO_LOCKED)
+            {
+                return i;
+            }
+            else
+            {
+                i = (i + 1) & (Q_SIZE - 1);
+            }
+            __nanosleep(ns);
+            if (ns < 32)
+                ns *= 2;
+        } while (1);
+    }
+    __device__ int getRWQueueEntry2() volatile
+    {
+        uint32_t ret = this->ticket.fetch_add(1, simt::memory_order_acq_rel);
+        uint32_t ret_q = ret & (Q_SIZE - 1);
+        do
+        {
+            if (atomicExch((int *)&entry_lock[ret_q], GPU_LOCKED) == GPU_NO_LOCKED)
+            {
+                return ret_q;
+            }
+        } while (1);
+        // assert(entry_lock[(ret & (GPU_RW_SIZE-1))] == GPU_NO_LOCKED);
+        return ret_q;
+    }
+    __device__ int getRWQueueEntry2_nonblocking(int &entry_index) volatile
+    {
+        uint32_t ret = this->ticket.fetch_add(1, simt::memory_order_acq_rel);
+        uint32_t ret_q = ret & (Q_SIZE - 1);
 
-    __device__ void putRWQueueEntry(int entry_index) volatile;
+        // 尝试非阻塞地锁定该槽位
+        if (atomicExch((int *)&entry_lock[ret_q], GPU_LOCKED) == GPU_NO_LOCKED)
+        {
+            // 成功获取锁
+            entry_index = ret_q;
+            return 1; // 1 表示成功
+        }
+
+        // 失败 (槽位已被其他线程锁定，或 Host 尚未处理)
+        // 立即返回失败，而不是在 do-while(1) 中自旋
+        entry_index = -1;
+        return 0; // 0 表示失败
+    }
+
+    __device__ void putRWQueueEntry(int entry_index) volatile
+    {
+        entry_lock[entry_index] = GPU_NO_LOCKED;
+        __threadfence();
+    }
 
     /* Initializer called by host */
-    __host__ void init(GpuRwQueue *_gpu_rw_queue) volatile;
+    __host__ void init(GpuRwQueueT<Q_SIZE> *_gpu_rw_queue) volatile
+    {
+        gpu_rw_queue = _gpu_rw_queue;
+        for (int i = 0; i < GPU_RW_SIZE; i++)
+        {
+            entry_lock[i] = GPU_NO_LOCKED;
+        }
+    }
 };
+
+// 模板类的实例化
+using GpuRwQueue = GpuRwQueueT<GPU_RW_SIZE_DEMAND>;
+using GpuFileRwManager = GpuFileRwManagerT<GPU_RW_SIZE_DEMAND>;
+
+// Prefetch 通道
+using GpuRwQueuePrefetch = GpuRwQueueT<GPU_RW_SIZE_PREFETCH>;
+using GpuFileRwManagerPrefetch = GpuFileRwManagerT<GPU_RW_SIZE_PREFETCH>;
 
 /* Called by GPU threads, and return a pointer pointing where valid data resides in GPU memory*/
 __device__ void *readDataFromHost(int _fd, size_t _size, off_t _offset);
@@ -778,6 +861,7 @@ public:
     void registerRangesLBA(uint64_t);
     uint16_t submit_read_data_to_hc_async(const uint64_t starting_lba, const uint64_t n_blocks, const unsigned long long hc_entry, uint32_t queue_id);
     void poll_and_complete_io(const uint16_t cid, uint32_t queue_id);
+    bool process_queue_head(uint32_t queue_id);
 
 #if USE_PREFETCH
     struct PrefetchCompletionInfo
@@ -794,7 +878,7 @@ public:
         std::mutex shard_mutex;
     };
 #endif
-
+    std::vector<std::thread> cpu_worker_threads;
     volatile GpuOpenFileTable *host_open_table;
     volatile GpuFileRwManager *host_rw_manager;
     volatile GpuFileRwManager *host_rw_manager_mem;
@@ -889,6 +973,8 @@ public:
     std::atomic<uint64_t> total_tier1_dirty_evicts;
     std::atomic<uint64_t> total_tier1_clean_evicts;
     std::atomic<uint64_t> total_hits;
+    std::atomic<uint64_t> total_prefetch_waits;          // 记录尝试等待的次数
+    std::atomic<uint64_t> total_prefetch_wait_successes; // 记录等待成功的次数
 
 private:
     uint64_t num_ctrl_pages_in_one_line;
@@ -1117,8 +1203,16 @@ public:
         free(this->sample_buffer);
         free(this->retain_buffer);
         // CUDA_SAFE_CALL(cudaFree(linear_reg_info_host));
-        CUDA_SAFE_CALL(cudaFree(ring_buf_h));
-        CUDA_SAFE_CALL(cudaFree(ring_buf_d));
+        if (ring_buf_h)
+        {
+            delete ring_buf_h;
+            ring_buf_h = NULL;
+        }
+        if (ring_buf_d)
+        {
+            CUDA_SAFE_CALL(cudaFree(ring_buf_d));
+            ring_buf_d = NULL;
+        }
         CUDA_SAFE_CALL(cudaStreamDestroy(this->sample_stream));
     }
 
@@ -1260,8 +1354,12 @@ public:
         // printf("ring buffer ready flag %u (%p)\n", *(ring_buf_h->ready), ring_buf_h->ready);
         while (!leaving)
         {
-            while (!*(ring_buf_h->ready))
-                ;
+            while (!*(ring_buf_h->ready) && !leaving)
+            {
+                std::this_thread::yield();
+            }
+            if (leaving)
+                break;
             void *gpu_addr = (void *)ring_buf_h->buffer;
             cudaMemcpyAsync((void *)this->sample_buffer, (const void *)gpu_addr, ring_buf_h->q_size * 16,
                             cudaMemcpyDeviceToHost, this->sample_stream);
@@ -1464,12 +1562,12 @@ size_t pc_mem_size;
 __device__ volatile GpuFileRwManager *gpu_rw_manager;
 __device__ volatile GpuFileRwManager *gpu_rw_manager_mem;
 #if USE_PREFETCH
-__device__ volatile GpuFileRwManager *gpu_rw_manager_prefetch; // 新增: 预取请求管理器 (GPU 指针)
+__device__ volatile GpuFileRwManagerPrefetch *gpu_rw_manager_prefetch; // 新增: 预取请求管理器 (GPU 指针)
 #endif
 __device__ volatile GpuRwQueue *gpu_rw_queue;
 __device__ volatile GpuRwQueue *gpu_rw_queue_mem;
 #if USE_PREFETCH
-__device__ volatile GpuRwQueue *gpu_rw_queue_prefetch; // 新增: 预取请求队列 (GPU 指针)
+__device__ volatile GpuRwQueuePrefetch *gpu_rw_queue_prefetch; // 新增: 预取请求队列 (GPU 指针)
 #endif
 __device__ volatile HostCacheRuntimeState *gpu_hc_runtime_state;
 __device__ PageProfileInfo *page_info_dev;
@@ -1611,6 +1709,68 @@ inline void HostCache::poll_and_complete_io(const uint16_t cid, uint32_t queue_i
     cq_dequeue(&this->qp[queue_id]->cq, &(this->cq_host[queue_id]), cq_pos, &this->qp[queue_id]->sq, head, head_);
 
     put_cid(&this->qp[queue_id]->sq, &(this->sq_host[queue_id]), cid);
+}
+
+bool HostCache::process_queue_head(uint32_t queue_id) {
+    nvm_queue_t* cq = &this->qp[queue_id]->cq;
+    nvm_queue_t* sq = &this->qp[queue_id]->sq;
+    nvm_queue_host_t* cq_h = &this->cq_host[queue_id];
+    nvm_queue_host_t* sq_h = &this->sq_host[queue_id];
+
+    // 1. 读取当前队头
+    uint32_t head = cq->head.load(simt::memory_order_relaxed);
+    uint32_t loc = head & cq->qs_minus_1;
+    volatile nvm_cpl_t* cpl = &((nvm_cpl_t*)cq->vaddr)[loc];
+
+    // 2. 检查 Phase Bit (P位)
+    uint32_t cpl_entry_dw3 = cpl->dword[3];
+    uint32_t phase = (cpl_entry_dw3 & 0x00010000) >> 16;
+    bool expected_phase = ((~(head >> cq->qs_log2)) & 0x01);
+
+    // 如果硬件还没写好，直接返回
+    if (phase != expected_phase) return false;
+
+    // 3. 硬件已写好！提取 CID
+    uint16_t cid = (uint16_t)(cpl_entry_dw3 & 0x0000ffff);
+
+    // 4. 推进队列 Head (解锁队头阻塞的关键！)
+    // 直接传 loc，不再需要锁等待，因为我们只处理 Head
+    cq_dequeue(cq, cq_h, (uint16_t)loc, sq, head, head); 
+    
+    // 5. 释放 CID 给 SQ
+    put_cid(sq, sq_h, cid);
+
+    // 6. 查找并回调上层请求
+    bool found = false;
+    for (int i = 0; i < NUM_COMPLETION_THREADS; i++) {
+        std::lock_guard<std::mutex> lock(outstanding_shards[i].shard_mutex);
+        auto it = outstanding_shards[i].outstanding_map.find(cid);
+        if (it != outstanding_shards[i].outstanding_map.end()) {
+            PrefetchCompletionInfo info = it->second;
+            
+            // 更新 T2 状态 (设为 VALID)
+            if (host_cache_state[info.bid].state.load(simt::memory_order_relaxed) == HOST_CACHE_ENTRY_PREFETCHING &&
+                host_cache_state[info.bid].tag == info.key) 
+            {
+                host_cache_state[info.bid].is_dirty = false;
+                host_cache_state[info.bid].state.store(HOST_CACHE_ENTRY_VALID, simt::memory_order_release);
+                if (info.replaced_invalid_slot) {
+                    valid_entry_count.fetch_add(1, std::memory_order_relaxed);
+                    __atomic_sub_fetch(num_idle_slots_h, 1, __ATOMIC_SEQ_CST);
+                }
+            }
+            host_cache_state[info.bid].lock.store(HOST_CACHE_ENTRY_UNLOCKED, simt::memory_order_release);
+            
+            // 从 Map 移除 & 释放 GPU 队列槽位
+            outstanding_shards[i].outstanding_map.erase(it);
+            this->host_rw_queue_prefetch->entries[info.queue_index].status = GPU_RW_EMPTY;
+            this->host_rw_manager_prefetch->entry_lock[info.queue_index] = GPU_NO_LOCKED;
+            
+            found = true;
+            break; 
+        }
+    }
+    return true; 
 }
 
 inline void read_data_to_hc(HostCache *hc, const uint64_t starting_lba, const uint64_t n_blocks, const unsigned long long hc_entry, uint32_t queue_id = 0)
@@ -1782,96 +1942,97 @@ __host__ void GpuRwQueueEntry::init() volatile
     status = GPU_RW_EMPTY;
 }
 
-__device__ GpuRwQueueEntry *GpuRwQueue::getEntryByIndex(int entry_index)
-{
-    return (&(entries[entry_index]));
-}
+//----------------------------------模板类前的函数实现--------------------------------
+// __device__ GpuRwQueueEntry *GpuRwQueue::getEntryByIndex(int entry_index)
+// {
+//     return (&(entries[entry_index]));
+// }
 
-__host__ void GpuRwQueue::init() volatile
-{
-    for (int i = 0; i < GPU_RW_SIZE; i++)
-    {
-        // entries[i]->init();
-        entries[i].init();
-        valid_in_pc[i] = malloc(DIV_ROUND_UP(64 * 1024 * 1024, 4096));
-    }
-}
+// __host__ void GpuRwQueue::init() volatile
+// {
+//     for (int i = 0; i < GPU_RW_SIZE; i++)
+//     {
+//         // entries[i]->init();
+//         entries[i].init();
+//         valid_in_pc[i] = malloc(DIV_ROUND_UP(64 * 1024 * 1024, 4096));
+//     }
+// }
 
-__device__ void *GpuFileRwManager::getBufferBase() volatile
-{
-    return (void *)buffer_base;
-}
+// __device__ void *GpuFileRwManager::getBufferBase() volatile
+// {
+//     return (void *)buffer_base;
+// }
 
-__forceinline__ __device__ int GpuFileRwManager::getRWQueueEntry() volatile
-{
-    uint32_t i = (blockIdx.x * blockDim.x + threadIdx.x) & (GPU_RW_SIZE - 1);
-    uint32_t ns = 2;
-    do
-    {
-        if (atomicExch((int *)&entry_lock[i], GPU_LOCKED) == GPU_NO_LOCKED)
-        {
-            return i;
-        }
-        else
-        {
-            i = (i + 1) & (GPU_RW_SIZE - 1);
-        }
-        __nanosleep(ns);
-        if (ns < 32)
-            ns *= 2;
-    } while (1);
-}
+// __forceinline__ __device__ int GpuFileRwManager::getRWQueueEntry() volatile
+// {
+//     uint32_t i = (blockIdx.x * blockDim.x + threadIdx.x) & (GPU_RW_SIZE - 1);
+//     uint32_t ns = 2;
+//     do
+//     {
+//         if (atomicExch((int *)&entry_lock[i], GPU_LOCKED) == GPU_NO_LOCKED)
+//         {
+//             return i;
+//         }
+//         else
+//         {
+//             i = (i + 1) & (GPU_RW_SIZE - 1);
+//         }
+//         __nanosleep(ns);
+//         if (ns < 32)
+//             ns *= 2;
+//     } while (1);
+// }
 
-__forceinline__ __device__ int GpuFileRwManager::getRWQueueEntry2() volatile
-{
-    uint32_t ret = this->ticket.fetch_add(1, simt::memory_order_acq_rel);
-    uint32_t ret_q = ret & (GPU_RW_SIZE - 1);
-    do
-    {
-        if (atomicExch((int *)&entry_lock[ret_q], GPU_LOCKED) == GPU_NO_LOCKED)
-        {
-            return ret_q;
-        }
-    } while (1);
-    // assert(entry_lock[(ret & (GPU_RW_SIZE-1))] == GPU_NO_LOCKED);
-    return ret_q;
-}
+// __forceinline__ __device__ int GpuFileRwManager::getRWQueueEntry2() volatile
+// {
+//     uint32_t ret = this->ticket.fetch_add(1, simt::memory_order_acq_rel);
+//     uint32_t ret_q = ret & (GPU_RW_SIZE - 1);
+//     do
+//     {
+//         if (atomicExch((int *)&entry_lock[ret_q], GPU_LOCKED) == GPU_NO_LOCKED)
+//         {
+//             return ret_q;
+//         }
+//     } while (1);
+//     // assert(entry_lock[(ret & (GPU_RW_SIZE-1))] == GPU_NO_LOCKED);
+//     return ret_q;
+// }
 
-__forceinline__ __device__ int GpuFileRwManager::getRWQueueEntry2_nonblocking(int &entry_index) volatile
-{
-    // 尝试获取一个 ticket
-    uint32_t ret = this->ticket.fetch_add(1, simt::memory_order_acq_rel);
-    uint32_t ret_q = ret & (GPU_RW_SIZE - 1); // GPU_RW_SIZE = 8192
+// __forceinline__ __device__ int GpuFileRwManager::getRWQueueEntry2_nonblocking(int &entry_index) volatile
+// {
+//     // 尝试获取一个 ticket
+//     uint32_t ret = this->ticket.fetch_add(1, simt::memory_order_acq_rel);
+//     uint32_t ret_q = ret & (GPU_RW_SIZE - 1); // GPU_RW_SIZE = 8192
 
-    // 尝试非阻塞地锁定该槽位
-    if (atomicExch((int *)&entry_lock[ret_q], GPU_LOCKED) == GPU_NO_LOCKED)
-    {
-        // 成功获取锁
-        entry_index = ret_q;
-        return 1; // 1 表示成功
-    }
+//     // 尝试非阻塞地锁定该槽位
+//     if (atomicExch((int *)&entry_lock[ret_q], GPU_LOCKED) == GPU_NO_LOCKED)
+//     {
+//         // 成功获取锁
+//         entry_index = ret_q;
+//         return 1; // 1 表示成功
+//     }
 
-    // 失败 (槽位已被其他线程锁定，或 Host 尚未处理)
-    // 立即返回失败，而不是在 do-while(1) 中自旋
-    entry_index = -1;
-    return 0; // 0 表示失败
-}
+//     // 失败 (槽位已被其他线程锁定，或 Host 尚未处理)
+//     // 立即返回失败，而不是在 do-while(1) 中自旋
+//     entry_index = -1;
+//     return 0; // 0 表示失败
+// }
 
-__device__ void GpuFileRwManager::putRWQueueEntry(int entry_index) volatile
-{
-    entry_lock[entry_index] = GPU_NO_LOCKED;
-    __threadfence();
-}
+// __device__ void GpuFileRwManager::putRWQueueEntry(int entry_index) volatile
+// {
+//     entry_lock[entry_index] = GPU_NO_LOCKED;
+//     __threadfence();
+// }
 
-__host__ void GpuFileRwManager::init(GpuRwQueue *_gpu_rw_queue) volatile
-{
-    gpu_rw_queue = _gpu_rw_queue;
-    for (int i = 0; i < GPU_RW_SIZE; i++)
-    {
-        entry_lock[i] = GPU_NO_LOCKED;
-    }
-}
-
+// __host__ void GpuFileRwManager::init(GpuRwQueue *_gpu_rw_queue) volatile
+// {
+//     gpu_rw_queue = _gpu_rw_queue;
+//     for (int i = 0; i < GPU_RW_SIZE; i++)
+//     {
+//         entry_lock[i] = GPU_NO_LOCKED;
+//     }
+// }
+//-------------------------------------end-------------------------------------------
 //__forceinline__ __device__
 __device__
     uint32_t
@@ -2948,8 +3109,8 @@ HostCache::HostCache(Controller *_ctrl, uint64_t _gpu_mem_size = 0) : ctrl(_ctrl
 #if USE_PREFETCH
     // 新增: 初始化预取通道
     fprintf(stderr, "Initializing Prefetch Channel (Manager + Queue)...\n");
-    INIT_SHARED_MEM_PTR(GpuFileRwManager, this->host_rw_manager_prefetch, gpu_rw_manager_prefetch);
-    INIT_SHARED_MEM_PTR(GpuRwQueue, this->host_rw_queue_prefetch, gpu_rw_queue_prefetch);
+    INIT_SHARED_MEM_PTR(GpuFileRwManagerPrefetch, this->host_rw_manager_prefetch, gpu_rw_manager_prefetch);
+    INIT_SHARED_MEM_PTR(GpuRwQueuePrefetch, this->host_rw_queue_prefetch, gpu_rw_queue_prefetch);
     // 结束
 #endif
 
@@ -3198,6 +3359,8 @@ HostCache::HostCache(Controller *_ctrl, uint64_t _gpu_mem_size = 0) : ctrl(_ctrl
     stream_mngr = new StreamManager();
     appName = "pagerank128M";
     fetch_from_host_count = 0;
+    total_prefetch_wait_successes = 0;
+    total_prefetch_waits = 0;
 
     // TODO: Handle Profile...
 #if APPLY_PROFILE
@@ -3297,6 +3460,76 @@ HostCache::~HostCache()
     std::cout << "\tTotal Dirty Evicts from Tier-1: " << total_tier1_dirty_evicts.load() << std::endl;
     std::cout << "Total Accesses: " << total_accesses.load() << std::endl;
 
+    uint64_t waits = total_prefetch_waits.load();
+    uint64_t successes = total_prefetch_wait_successes.load();
+    std::cout << "------------------------------------------------" << std::endl;
+    std::cout << "[Prefetch Instrumentation]" << std::endl;
+    std::cout << "Total Prefetch Waits     : " << waits << std::endl;
+    std::cout << "Total Wait Successes     : " << successes << std::endl;
+    if (waits > 0)
+    {
+        std::cout << "Wait Success Rate        : " << (double)successes / waits * 100.0 << "%" << std::endl;
+    }
+
+    // ================= [FIX START: 停止并回收所有子线程] =================
+    if (!cpu_worker_threads.empty())
+    {
+        std::cerr << "Joining CPU worker threads...\n";
+        for (auto &t : cpu_worker_threads)
+        {
+            if (t.joinable())
+            {
+                t.join();
+            }
+        }
+        cpu_worker_threads.clear();
+        std::cerr << "CPU worker threads joined.\n";
+    }
+
+#if USE_PREFETCH
+    std::cerr << "Stopping Prefetch threads...\n";
+
+    // Join 所有 Prefetch 提交线程
+    // 注意：Prefetch 线程依赖 revoke_runtime 全局变量，
+    // 此时 revoke_runtime 应该已经是 true 了 (由 revokeHostRuntime 设置)。
+    for (uint64_t i = 0; i < NUM_PREFETCH_THREADS; i++)
+    {
+        // 使用 pthread_tryjoin_np 或直接 join，防止重复 join (如果之前逻辑混乱的话)
+        // 这里假设这是唯一 join 的地方
+        int ret = pthread_join(host_prefetch_threads[i], NULL);
+        if (ret != 0)
+            fprintf(stderr, "Join prefetch thread %lu failed/already joined\n", i);
+    }
+    this->completion_thread_running.store(false, std::memory_order_release);
+
+    std::cerr << "Stopping Completion threads...\n";
+    // Join 所有 Completion 线程
+    for (uint64_t i = 0; i < NUM_COMPLETION_THREADS; i++)
+    {
+        int ret = pthread_join(host_completion_threads[i], NULL);
+        if (ret != 0)
+            fprintf(stderr, "Join completion thread %lu failed/already joined\n", i);
+    }
+#endif
+
+    std::cerr << "All threads stopped safely.\n";
+    // ================= [FIX END] =================
+
+    // 停止 MemSampleCollector
+    if (this->mem_sample_collector)
+    {
+        std::cerr << "Stopping MemSampleCollector...\n";
+        // 设置标志位，让 collector_thread 跳出循环
+        this->mem_sample_collector->leaving = true;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        // MemSampleCollector 的析构函数如果包含 thread.join() 最好，
+        // 如果没有，我们至少保证了它能退出循环。
+        // 这里显式 delete 会触发它的析构。
+        delete this->mem_sample_collector;
+        this->mem_sample_collector = NULL;
+        std::cerr << "Stopped MemSampleCollector.\n";
+    }
+
     // cudaFreeHost(host_mem);
     std::cerr << "About to cudaHostUnregister host_mem...\n";
     cudaHostUnregister(host_mem);
@@ -3367,6 +3600,15 @@ HostCache::~HostCache()
 //{
 //     this->gds_handlers[_gds_handler->getCPUfd()] = _gds_handler;
 // }
+
+static inline void cpu_relax()
+{
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+    __asm__ volatile("pause" ::: "memory");
+#elif defined(__aarch64__)
+    __asm__ volatile("yield" ::: "memory");
+#endif
+}
 
 void HostCache::handleRequest(int queue_index)
 {
@@ -3692,14 +3934,59 @@ void HostCache::handleRequest(int queue_index)
         // [仅当在 map 中找到时才继续]
         if (found_in_map)
         {
-            // [日志补丁 1.2: 确认 T2 命中]
-            // 我们只在 T2 命中时才关心锁，T2 未命中（FETCH_FAILED）是另一种情况
-            // #if PREFETCH_DEBUG
-            //             fprintf(stderr, "[%.3fms] Host(Fetch) [Q:%d]: Key 0x%lx FOUND in T2 map (Slot %lu). Checking lock.\n",
-            //                     std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(fetch_start_time.time_since_epoch()).count(),
-            //                     queue_index, key, _bid);
-            // #endif
-            // check if address is still valid
+            // 性能计时器
+            // auto start_wait = std::chrono::high_resolution_clock::now();
+            bool waited = false;
+
+            // 阻塞等待 PREFETCHING 状态结束
+            // 我们不持有任何锁进行等待，允许预取线程更新状态
+            if (host_cache_state[_bid].state.load(simt::std::memory_order_relaxed) == HOST_CACHE_ENTRY_PREFETCHING)
+            {
+                total_prefetch_waits.fetch_add(1, std::memory_order_relaxed);
+            }
+
+            int spin_count = 0;
+            while (true)
+            {
+                uint32_t s = host_cache_state[_bid].state.load(simt::std::memory_order_acquire);
+                // 1. 如果 Tag 变了，说明槽位被回收了，停止等待
+                if (host_cache_state[_bid].tag != key)
+                    break;
+                // 2. 如果状态是 PREFETCHING，继续等待
+                if (s == HOST_CACHE_ENTRY_PREFETCHING)
+                {
+                    waited = true;
+                    if (spin_count < 1024)
+                    {
+                        cpu_relax(); // 自旋等待
+                    }
+                    else
+                    {
+                        usleep(1); // 超过一定次数让出 CPU，避免死锁系统
+                    }
+                    spin_count++;
+
+                    if (spin_count > 10000)
+                        break;
+                }
+                else
+                {
+
+                    // 3. 状态已变为 VALID (完成) 或 INVALID (失败)，退出循环
+                    if (waited && s == HOST_CACHE_ENTRY_VALID)
+                    {
+                        total_prefetch_wait_successes.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    break;
+                }
+            }
+
+            // if (waited)
+            // {
+            //     auto end_wait = std::chrono::high_resolution_clock::now();
+            //     // 将 elapsed 记录到某个全局统计 buffer
+            // }
+
             do
             {
                 // (确保物理状态也是 VALID 且 tag 匹配)
@@ -4283,130 +4570,160 @@ void HostCache::prefetchLoop()
     }
 }
 
+// void HostCache::completionLoop(uint64_t worker_id)
+// {
+//     // 获取此 worker 线程*专属*的分片
+//     PrefetchShard &my_shard = outstanding_shards[worker_id];
+
+//     // 用于临时存储*此工作线程*要处理的条目，以避免在 I/O 期间锁住 map
+//     std::vector<uint16_t> cids_to_poll;
+//     cids_to_poll.reserve(HOST_QUEUE_NUM_ENTRIES / NUM_COMPLETION_THREADS + 1); //
+
+//     while (this->completion_thread_running.load(std::memory_order_acquire))
+//     {
+//         cids_to_poll.clear();
+
+//         // 1. 锁定*此分片*，复制 CIDs
+//         {
+//             std::lock_guard<std::mutex> lock(my_shard.shard_mutex);
+//             if (my_shard.outstanding_map.empty())
+//             {
+//                 // Map 为空，无需工作
+//             }
+//             else
+//             {
+//                 // 遍历*此分片*的 map，将 CIDs 复制到本地 vector
+//                 for (auto const &[cid, info] : my_shard.outstanding_map)
+//                 {
+//                     cids_to_poll.push_back(cid);
+//                 }
+//             }
+//         } // 释放此分片的锁
+
+//         if (cids_to_poll.empty())
+//         {
+//             std::this_thread::yield();
+//             continue;
+//         }
+
+//         for (uint16_t cid : cids_to_poll)
+//         {
+//             PrefetchCompletionInfo info;
+//             bool entry_found = false;
+
+//             // 3. 再次锁定*此分片*，获取此 cid 的完整元数据
+//             {
+//                 std::lock_guard<std::mutex> lock(my_shard.shard_mutex);
+//                 auto it = my_shard.outstanding_map.find(cid);
+//                 if (it != my_shard.outstanding_map.end())
+//                 {
+//                     info = it->second; // 复制元数据
+//                     entry_found = true;
+//                     // **注意**：我们还*不*移除它，直到 I/O 确认完成
+//                 }
+//                 // else: I/O 可能在上一轮循环中被处理了（如果轮询非常快）
+//             }
+
+//             if (!entry_found)
+//             {
+//                 continue;
+//             }
+
+//             // 4.  - 阻塞式等待 I/O 完成 (在锁*之外*执行)
+//             //
+//             this->poll_and_complete_io(cid, info.queue_id);
+
+//             // 5. I/O 已完成，现在我们必须安全地更新 T2 元数据
+//             // #if PREFETCH_DEBUG
+//             //             auto complete_time = std::chrono::high_resolution_clock::now();
+//             //             fprintf(stderr, "[%.3fms] Host(Prefetch-Complete) [W:%lu]: T3->T2 I/O done for Key 0x%lx -> T2 Slot %lu.\n",
+//             //                     std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(complete_time.time_since_epoch()).count(),
+//             //                     worker_id, info.key, info.bid);
+//             // #endif
+
+//             // fprintf(stderr, "[Prefetch-Complete] [Worker: %lu] I/O Complete for key 0x%lx -> T2 slot %lu.\n",
+//             //         worker_id, info.key, info.bid);
+
+//             // 可能不需要
+//             while (host_cache_state[info.bid].lock.exchange(
+//                        HOST_CACHE_ENTRY_LOCKED,
+//                        simt::std::memory_order_acquire) != HOST_CACHE_ENTRY_UNLOCKED)
+//             {
+//             }
+
+//             // 双重检查（Double-Check）状态
+//             // 在我们等待 DMA 和锁的期间，这个host槽位可能已被驱逐
+//             if (host_cache_state[info.bid].state.load(simt::std::memory_order_relaxed) == HOST_CACHE_ENTRY_PREFETCHING &&
+//                 host_cache_state[info.bid].tag == info.key)
+//             {
+//                 // 成功：DMA 完成，状态和 Tag 均匹配。
+//                 // 现在正式将此槽位标记为 VALID
+//                 host_cache_state[info.bid].is_dirty = false;
+//                 host_cache_state[info.bid].state.store(HOST_CACHE_ENTRY_VALID, simt::std::memory_order_release);
+
+//                 // 仅当替换的是 INVALID 槽位时才更新 T2 计数器
+//                 if (info.replaced_invalid_slot)
+//                 {
+//                     valid_entry_count.fetch_add((uint64_t)1, std::memory_order_acquire);
+//                     __atomic_sub_fetch(num_idle_slots_h, 1, __ATOMIC_SEQ_CST);
+//                 }
+//             }
+//             else
+//             {
+//                 // 竞态失败：在我们 DMA 完成时，T1 已驱逐了此页面
+//                 // (find_slot 将 PREFETCHING 状态清除了)
+//                 // 或者 Key 不匹配。
+//                 // DMA 数据被丢弃，T2 槽位状态保持不变（很可能是 INVALID）。
+//                 // #if PREFETCH_DEBUG
+//                 //                 fprintf(stderr, "[Prefetch-Complete] Stale completion for Key 0x%lx (Slot %lu). Data discarded.\n", info.key, info.bid);
+//                 // #endif
+//             }
+
+//             // *必须*释放 T2 槽位锁
+//             host_cache_state[info.bid].lock.store(HOST_CACHE_ENTRY_UNLOCKED, simt::std::memory_order_release);
+
+//             // 最后，从*此分片*的 map 中移除已完成的条目
+//             {
+//                 std::lock_guard<std::mutex> lock(my_shard.shard_mutex);
+//                 my_shard.outstanding_map.erase(cid); // 从 map 中移除
+//             }
+//             this->host_rw_queue_prefetch->entries[info.queue_index].status = GPU_RW_EMPTY;
+//             this->host_rw_manager_prefetch->entry_lock[info.queue_index] = GPU_NO_LOCKED;
+//             __sync_synchronize(); // 确保 GPU 能看到这些变化
+//         } // 结束 for 循环 (轮询 cids)
+//     } // 结束 while 循环
+// }
+// host_cache.h
+
 void HostCache::completionLoop(uint64_t worker_id)
 {
-    // 获取此 worker 线程*专属*的分片
-    PrefetchShard &my_shard = outstanding_shards[worker_id];
+    // 分配队列任务
+    std::vector<uint32_t> my_queues;
+    for (uint32_t q = worker_id; q < NUM_NVME_QUEUES; q += NUM_COMPLETION_THREADS) {
+        my_queues.push_back(q);
+    }
 
-    // 用于临时存储*此工作线程*要处理的条目，以避免在 I/O 期间锁住 map
-    std::vector<uint16_t> cids_to_poll;
-    cids_to_poll.reserve(HOST_QUEUE_NUM_ENTRIES / NUM_COMPLETION_THREADS + 1); //
+    printf("Completion Thread %lu serving %lu queues.\n", worker_id, my_queues.size());
 
-    while (this->completion_thread_running.load(std::memory_order_acquire))
+    while (!revoke_runtime)
     {
-        cids_to_poll.clear();
-
-        // 1. 锁定*此分片*，复制 CIDs
-        {
-            std::lock_guard<std::mutex> lock(my_shard.shard_mutex);
-            if (my_shard.outstanding_map.empty())
-            {
-                // Map 为空，无需工作
+        bool did_work = false;
+        for (uint32_t qid : my_queues) {
+            while (process_queue_head(qid)) {
+                did_work = true;
             }
-            else
-            {
-                // 遍历*此分片*的 map，将 CIDs 复制到本地 vector
-                for (auto const &[cid, info] : my_shard.outstanding_map)
-                {
-                    cids_to_poll.push_back(cid);
-                }
-            }
-        } // 释放此分片的锁
-
-        if (cids_to_poll.empty())
-        {
-            usleep(1);
-            continue;
         }
-
-        for (uint16_t cid : cids_to_poll)
-        {
-            PrefetchCompletionInfo info;
-            bool entry_found = false;
-
-            // 3. 再次锁定*此分片*，获取此 cid 的完整元数据
-            {
-                std::lock_guard<std::mutex> lock(my_shard.shard_mutex);
-                auto it = my_shard.outstanding_map.find(cid);
-                if (it != my_shard.outstanding_map.end())
-                {
-                    info = it->second; // 复制元数据
-                    entry_found = true;
-                    // **注意**：我们还*不*移除它，直到 I/O 确认完成
-                }
-                // else: I/O 可能在上一轮循环中被处理了（如果轮询非常快）
-            }
-
-            if (!entry_found)
-            {
-                continue;
-            }
-
-            // 4.  - 阻塞式等待 I/O 完成 (在锁*之外*执行)
-            //
-            this->poll_and_complete_io(cid, info.queue_id);
-
-            // 5. I/O 已完成，现在我们必须安全地更新 T2 元数据
-            // #if PREFETCH_DEBUG
-            //             auto complete_time = std::chrono::high_resolution_clock::now();
-            //             fprintf(stderr, "[%.3fms] Host(Prefetch-Complete) [W:%lu]: T3->T2 I/O done for Key 0x%lx -> T2 Slot %lu.\n",
-            //                     std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(complete_time.time_since_epoch()).count(),
-            //                     worker_id, info.key, info.bid);
-            // #endif
-
-            // fprintf(stderr, "[Prefetch-Complete] [Worker: %lu] I/O Complete for key 0x%lx -> T2 slot %lu.\n",
-            //         worker_id, info.key, info.bid);
-
-            //可能不需要
-            while (host_cache_state[info.bid].lock.exchange(
-                       HOST_CACHE_ENTRY_LOCKED,
-                       simt::std::memory_order_acquire) != HOST_CACHE_ENTRY_UNLOCKED)
-            {
-                usleep(1); // 自旋
-            }
-
-            // 双重检查（Double-Check）状态
-            // 在我们等待 DMA 和锁的期间，这个host槽位可能已被驱逐
-            if (host_cache_state[info.bid].state.load(simt::std::memory_order_relaxed) == HOST_CACHE_ENTRY_PREFETCHING &&
-                host_cache_state[info.bid].tag == info.key)
-            {
-                // 成功：DMA 完成，状态和 Tag 均匹配。
-                // 现在正式将此槽位标记为 VALID
-                host_cache_state[info.bid].is_dirty = false;
-                host_cache_state[info.bid].state.store(HOST_CACHE_ENTRY_VALID, simt::std::memory_order_release);
-
-                // 仅当替换的是 INVALID 槽位时才更新 T2 计数器
-                if (info.replaced_invalid_slot)
-                {
-                    valid_entry_count.fetch_add((uint64_t)1, std::memory_order_acquire);
-                    __atomic_sub_fetch(num_idle_slots_h, 1, __ATOMIC_SEQ_CST);
-                }
-            }
-            else
-            {
-                // 竞态失败：在我们 DMA 完成时，T1 已驱逐了此页面
-                // (find_slot 将 PREFETCHING 状态清除了)
-                // 或者 Key 不匹配。
-                // DMA 数据被丢弃，T2 槽位状态保持不变（很可能是 INVALID）。
-                // #if PREFETCH_DEBUG
-                //                 fprintf(stderr, "[Prefetch-Complete] Stale completion for Key 0x%lx (Slot %lu). Data discarded.\n", info.key, info.bid);
-                // #endif
-            }
-
-            // *必须*释放 T2 槽位锁
-            host_cache_state[info.bid].lock.store(HOST_CACHE_ENTRY_UNLOCKED, simt::std::memory_order_release);
-
-            // 最后，从*此分片*的 map 中移除已完成的条目
-            {
-                std::lock_guard<std::mutex> lock(my_shard.shard_mutex);
-                my_shard.outstanding_map.erase(cid); // 从 map 中移除
-            }
-            this->host_rw_queue_prefetch->entries[info.queue_index].status = GPU_RW_EMPTY;
-            this->host_rw_manager_prefetch->entry_lock[info.queue_index] = GPU_NO_LOCKED;
-            __sync_synchronize(); // 确保 GPU 能看到这些变化
-        } // 结束 for 循环 (轮询 cids)
-    } // 结束 while 循环
+        if (!did_work) std::this_thread::yield();
+    }
+    
+    // 退出前把剩下的处理完
+    for (uint32_t qid : my_queues) {
+        while (process_queue_head(qid));
+    }
+    printf("Completion Thread %lu exited.\n", worker_id);
 }
+
+
 #endif // USE_PREFETCH
 
 void HostCache::debugPrint()
@@ -4452,10 +4769,7 @@ void HostCache::threadLoop(int tid)
         }
         else
         {
-            // fprintf(stderr, "[DEBUG] T2-Worker[%d]: Idle, calling usleep(100).\n", tid);
-            // fflush(stderr);
-            // 仅在没有挂起请求时休眠
-            usleep(100); // 休眠 100 微秒
+            std::this_thread::yield();
         }
         // Chia-Hao: 1117
         if (revoke_runtime)
@@ -4487,20 +4801,24 @@ void HostCache::threadLoop2(int tid)
 
 void HostCache::launchThreadLoop()
 {
-    fprintf(stderr, "[DEBUG] launchThreadLoop: ENTERED. Starting %d CPU threads...\n", (int)NUM_CPU_CORES);
-    fflush(stderr);
+    // fprintf(stderr, "[DEBUG] launchThreadLoop: ENTERED. Starting %d CPU threads...\n", (int)NUM_CPU_CORES);
+    // fflush(stderr);
+    cpu_worker_threads.clear();
     int tid = 0;
     // int req_count = 0;
     for (tid = 0; tid < NUM_CPU_CORES; tid++)
     {
-        fprintf(stderr, "[DEBUG] launchThreadLoop: Creating std::thread %d...\n", tid);
-        fflush(stderr);
-        std::thread handler_thread(&HostCache::threadLoop, std::ref(*this), tid);
-        // std::thread handler_thread(&HostCache::threadLoop2, std::ref(*this), tid);
-        handler_thread.detach();
+        // fprintf(stderr, "[DEBUG] launchThreadLoop: Creating std::thread %d...\n", tid);
+        // fflush(stderr);
+
+        // std::thread handler_thread(&HostCache::threadLoop, std::ref(*this), tid);
+        // // std::thread handler_thread(&HostCache::threadLoop2, std::ref(*this), tid);
+        // handler_thread.detach();
+
+        cpu_worker_threads.emplace_back(&HostCache::threadLoop, std::ref(*this), tid);
     }
-    fprintf(stderr, "[DEBUG] launchThreadLoop: All %d CPU threads created. Entering sleep loop.\n", (int)NUM_CPU_CORES);
-    fflush(stderr);
+    // fprintf(stderr, "[DEBUG] launchThreadLoop: All %d CPU threads created. Entering sleep loop.\n", (int)NUM_CPU_CORES);
+    // fflush(stderr);
     while (!revoke_runtime)
         sleep(1);
 }
@@ -4824,26 +5142,10 @@ void revokeHostRuntime()
 
     // int st = pthread_cancel(host_runtime_thread);
     // if (st != 0) std::cerr << "Revoking failed...\n";
-    pthread_join(host_runtime_thread, NULL);
-#if USE_PREFETCH
-    // 等待所有预取*提交*线程退出
-    for (uint64_t i = 0; i < NUM_PREFETCH_THREADS; i++)
+    if (host_runtime_thread)
     {
-        pthread_join(host_prefetch_threads[i], NULL);
+        pthread_join(host_runtime_thread, NULL);
     }
-
-    // 停止并等待*完成*线程退出
-    if (host_cache)
-    {
-        // 设置标志，让所有 completionLoop 退出
-        host_cache->completion_thread_running.store(false, std::memory_order_release);
-    }
-    // 等待所有 completionLoop 线程结束
-    for (uint64_t i = 0; i < NUM_COMPLETION_THREADS; i++)
-    {
-        pthread_join(host_completion_threads[i], NULL);
-    }
-#endif
 
     // for (uint64_t i = 0; i < NUM_FLUSH_THREADS; i++) {
     //     pthread_join(flush_thread[i], NULL);
