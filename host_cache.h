@@ -836,7 +836,12 @@ public:
 class HostCache
 {
 public:
-    HostCache(Controller *ctrl, uint64_t gpu_mem_size);
+    HostCache(Controller *ctrl, uint64_t gpu_mem_size
+#if USE_PREFETCH
+              ,
+              uint64_t batch_size
+#endif
+    );
     HostCache();
     ~HostCache();
     // void setGDSHandler(GDS_HANDLER* _gds_handler);
@@ -862,7 +867,7 @@ public:
     uint16_t submit_read_data_to_hc_async(const uint64_t starting_lba, const uint64_t n_blocks, const unsigned long long hc_entry, uint32_t queue_id);
     void poll_and_complete_io(const uint16_t cid, uint32_t queue_id);
     bool process_queue_head(uint32_t queue_id);
-
+    int process_queue_batch(uint32_t queue_id, int max_batch = 32);
 #if USE_PREFETCH
     struct PrefetchCompletionInfo
     {
@@ -909,6 +914,7 @@ public:
     cudaStream_t cu_stream;
     Controller *ctrl;
 
+    std::atomic<bool> prefetchers_exited;
 #define NUM_NVME_QUEUES 1
     QueuePair *qp[NUM_NVME_QUEUES];
     // TODO: initialize following
@@ -920,6 +926,9 @@ public:
     simt::atomic<uint64_t, simt::thread_scope_device> *q_lock;
     simt::atomic<uint64_t, simt::thread_scope_device> *extra_reads;
 
+#if USE_PREFETCH
+    uint64_t completion_batch_size;
+#endif
     uint64_t gpu_mem_size;
     uint32_t *linear_reg_info_idx_h;
     LinearRegInfo *linear_reg_info_h;
@@ -1557,6 +1566,7 @@ void preLoadData(int fd, size_t page_size);
 // void registerGPUMem(void*, size_t);
 
 size_t pc_mem_size;
+static size_t completion_batch_size_g = 32;
 
 // extern __device__ volatile GpuOpenFileTable* gpu_open_table;
 __device__ volatile GpuFileRwManager *gpu_rw_manager;
@@ -1711,16 +1721,17 @@ inline void HostCache::poll_and_complete_io(const uint16_t cid, uint32_t queue_i
     put_cid(&this->qp[queue_id]->sq, &(this->sq_host[queue_id]), cid);
 }
 
-bool HostCache::process_queue_head(uint32_t queue_id) {
-    nvm_queue_t* cq = &this->qp[queue_id]->cq;
-    nvm_queue_t* sq = &this->qp[queue_id]->sq;
-    nvm_queue_host_t* cq_h = &this->cq_host[queue_id];
-    nvm_queue_host_t* sq_h = &this->sq_host[queue_id];
+bool HostCache::process_queue_head(uint32_t queue_id)
+{
+    nvm_queue_t *cq = &this->qp[queue_id]->cq;
+    nvm_queue_t *sq = &this->qp[queue_id]->sq;
+    nvm_queue_host_t *cq_h = &this->cq_host[queue_id];
+    nvm_queue_host_t *sq_h = &this->sq_host[queue_id];
 
     // 1. 读取当前队头
     uint32_t head = cq->head.load(simt::memory_order_relaxed);
     uint32_t loc = head & cq->qs_minus_1;
-    volatile nvm_cpl_t* cpl = &((nvm_cpl_t*)cq->vaddr)[loc];
+    volatile nvm_cpl_t *cpl = &((nvm_cpl_t *)cq->vaddr)[loc];
 
     // 2. 检查 Phase Bit (P位)
     uint32_t cpl_entry_dw3 = cpl->dword[3];
@@ -1728,49 +1739,149 @@ bool HostCache::process_queue_head(uint32_t queue_id) {
     bool expected_phase = ((~(head >> cq->qs_log2)) & 0x01);
 
     // 如果硬件还没写好，直接返回
-    if (phase != expected_phase) return false;
+    if (phase != expected_phase)
+        return false;
 
     // 3. 硬件已写好！提取 CID
     uint16_t cid = (uint16_t)(cpl_entry_dw3 & 0x0000ffff);
 
     // 4. 推进队列 Head (解锁队头阻塞的关键！)
     // 直接传 loc，不再需要锁等待，因为我们只处理 Head
-    cq_dequeue(cq, cq_h, (uint16_t)loc, sq, head, head); 
-    
+    cq_dequeue(cq, cq_h, (uint16_t)loc, sq, head, head);
+
     // 5. 释放 CID 给 SQ
     put_cid(sq, sq_h, cid);
 
-    // 6. 查找并回调上层请求
-    bool found = false;
-    for (int i = 0; i < NUM_COMPLETION_THREADS; i++) {
-        std::lock_guard<std::mutex> lock(outstanding_shards[i].shard_mutex);
-        auto it = outstanding_shards[i].outstanding_map.find(cid);
-        if (it != outstanding_shards[i].outstanding_map.end()) {
+    // 6. O(1) 直接定位分片，不再循环扫描
+    // 必须确保提交时的哈希算法也是 cid % NUM_COMPLETION_THREADS
+    uint32_t shard_idx = cid % NUM_COMPLETION_THREADS;
+
+    {
+        // 只锁这一个分片，大幅减少锁竞争
+        std::lock_guard<std::mutex> lock(outstanding_shards[shard_idx].shard_mutex);
+
+        auto it = outstanding_shards[shard_idx].outstanding_map.find(cid);
+        if (it != outstanding_shards[shard_idx].outstanding_map.end())
+        {
             PrefetchCompletionInfo info = it->second;
-            
-            // 更新 T2 状态 (设为 VALID)
+
+            // 更新 T2 状态
             if (host_cache_state[info.bid].state.load(simt::memory_order_relaxed) == HOST_CACHE_ENTRY_PREFETCHING &&
-                host_cache_state[info.bid].tag == info.key) 
+                host_cache_state[info.bid].tag == info.key)
             {
                 host_cache_state[info.bid].is_dirty = false;
                 host_cache_state[info.bid].state.store(HOST_CACHE_ENTRY_VALID, simt::memory_order_release);
-                if (info.replaced_invalid_slot) {
+                if (info.replaced_invalid_slot)
+                {
                     valid_entry_count.fetch_add(1, std::memory_order_relaxed);
                     __atomic_sub_fetch(num_idle_slots_h, 1, __ATOMIC_SEQ_CST);
                 }
             }
             host_cache_state[info.bid].lock.store(HOST_CACHE_ENTRY_UNLOCKED, simt::memory_order_release);
-            
-            // 从 Map 移除 & 释放 GPU 队列槽位
-            outstanding_shards[i].outstanding_map.erase(it);
+            // 移除记录
+            outstanding_shards[shard_idx].outstanding_map.erase(it);
+
+            // 释放 GPU 队列
             this->host_rw_queue_prefetch->entries[info.queue_index].status = GPU_RW_EMPTY;
             this->host_rw_manager_prefetch->entry_lock[info.queue_index] = GPU_NO_LOCKED;
-            
-            found = true;
-            break; 
+        }
+        else
+        {
+            // 如果在正确的分片没找到，说明逻辑有误或这不是预取请求
+            // fprintf(stderr, "PerfWarn: CID %u not found in shard %u\n", cid, shard_idx);
         }
     }
-    return true; 
+    return true;
+}
+int HostCache::process_queue_batch(uint32_t queue_id, int max_batch)
+{
+    nvm_queue_t *cq = &this->qp[queue_id]->cq;
+    nvm_queue_t *sq = &this->qp[queue_id]->sq;
+    nvm_queue_host_t *cq_h = &this->cq_host[queue_id];
+    nvm_queue_host_t *sq_h = &this->sq_host[queue_id];
+
+    int processed = 0;
+    uint32_t head = cq->head.load(simt::memory_order_relaxed); // 只读一次 Head
+    uint32_t start_head = head;
+
+    uint16_t max_sq_head = 0;
+    bool sq_head_updated = false;
+
+    // --- 1. 批量读取与处理 Loop ---
+    for (int i = 0; i < max_batch; i++)
+    {
+        uint32_t loc = head & cq->qs_minus_1;
+        volatile nvm_cpl_t *cpl = &((nvm_cpl_t *)cq->vaddr)[loc];
+
+        // 检查 Phase Bit
+        uint32_t cpl_entry_dw3 = cpl->dword[3];
+        uint32_t phase = (cpl_entry_dw3 & 0x00010000) >> 16;
+        bool expected_phase = ((~(head >> cq->qs_log2)) & 0x01);
+
+        if (phase != expected_phase)
+            break; // 后面没数据了，停止
+
+        // 有数据！处理它
+        uint16_t cid = (uint16_t)(cpl_entry_dw3 & 0x0000ffff);
+
+        max_sq_head = (uint16_t)(cpl->dword[2] & 0xffff);
+        sq_head_updated = true;
+
+        // [逻辑优化] 这里我们暂不更新 Doorbell，只归还 CID
+        // 注意：这里需要一个轻量级的 put_cid，或者直接操作 bitmap
+        // 假设 put_cid 开销很小（只是原子变量操作）
+        put_cid(sq, sq_h, cid);
+
+        // [处理元数据 - 保持 O(1)]
+        uint32_t shard_idx = cid % NUM_COMPLETION_THREADS;
+        {
+            std::lock_guard<std::mutex> lock(outstanding_shards[shard_idx].shard_mutex);
+            auto it = outstanding_shards[shard_idx].outstanding_map.find(cid);
+            if (it != outstanding_shards[shard_idx].outstanding_map.end())
+            {
+                PrefetchCompletionInfo info = it->second;
+                // 更新 T2 状态
+                if (host_cache_state[info.bid].state.load(simt::memory_order_relaxed) == HOST_CACHE_ENTRY_PREFETCHING &&
+                    host_cache_state[info.bid].tag == info.key)
+                {
+                    host_cache_state[info.bid].is_dirty = false;
+                    host_cache_state[info.bid].state.store(HOST_CACHE_ENTRY_VALID, simt::memory_order_release);
+                    if (info.replaced_invalid_slot)
+                    {
+                        valid_entry_count.fetch_add(1, std::memory_order_relaxed);
+                        __atomic_sub_fetch(num_idle_slots_h, 1, __ATOMIC_SEQ_CST);
+                    }
+                }
+                host_cache_state[info.bid].lock.store(HOST_CACHE_ENTRY_UNLOCKED, simt::memory_order_release);
+
+                outstanding_shards[shard_idx].outstanding_map.erase(it);
+                this->host_rw_queue_prefetch->entries[info.queue_index].status = GPU_RW_EMPTY;
+                this->host_rw_manager_prefetch->entry_lock[info.queue_index] = GPU_NO_LOCKED;
+            }
+        }
+
+        // 推进本地 Head 指针
+        head++;
+        processed++;
+    }
+
+    // --- 2. 批量提交 Doorbell (关键性能点) ---
+    if (processed > 0)
+    {
+
+        cq->head.store(head, simt::memory_order_release);
+
+        // 更新硬件 Doorbell (MMIO 写)
+        uint32_t new_db = head & cq->qs_minus_1;
+        *(cq->db) = new_db;
+
+        if (sq_head_updated)
+        {
+            sq->head.store(max_sq_head, simt::memory_order_release);
+        }
+    }
+
+    return processed;
 }
 
 inline void read_data_to_hc(HostCache *hc, const uint64_t starting_lba, const uint64_t n_blocks, const unsigned long long hc_entry, uint32_t queue_id = 0)
@@ -3096,8 +3207,16 @@ __global__ void verify(void *ptr)
     printf("page_profile_info %lx\n", (uint64_t)page_info_dev);
 }
 
-HostCache::HostCache(Controller *_ctrl, uint64_t _gpu_mem_size = 0) : ctrl(_ctrl), gpu_mem_size(_gpu_mem_size)
-// HostCache::HostCache()
+HostCache::HostCache(Controller *_ctrl, uint64_t _gpu_mem_size
+#if USE_PREFETCH
+                     ,
+                     uint64_t _batch_size
+#endif
+                     ) : ctrl(_ctrl), gpu_mem_size(_gpu_mem_size), prefetchers_exited(false)
+#if USE_PREFETCH
+                         ,
+                         completion_batch_size(_batch_size)
+#endif
 {
     // INIT_SHARED_MEM_PTR(GpuOpenFileTable, this->host_open_table, gpu_open_table);
     INIT_SHARED_MEM_PTR(GpuFileRwManager, this->host_rw_manager, gpu_rw_manager);
@@ -3362,6 +3481,9 @@ HostCache::HostCache(Controller *_ctrl, uint64_t _gpu_mem_size = 0) : ctrl(_ctrl
     total_prefetch_wait_successes = 0;
     total_prefetch_waits = 0;
 
+#if USE_PREFETCH
+    fprintf(stderr, "[DEBUG] HostCache initialized with Batch Size: %lu\n", completion_batch_size);
+#endif
     // TODO: Handle Profile...
 #if APPLY_PROFILE
     readProfiledLog();
@@ -3429,7 +3551,6 @@ HostCache::HostCache(Controller *_ctrl, uint64_t _gpu_mem_size = 0) : ctrl(_ctrl
 
 #endif
     fprintf(stderr, "[DEBUG] HostCache Constructor: COMPLETED.\n");
-    fflush(stderr); // 强制刷新
 
 #endif
 }
@@ -3494,22 +3615,18 @@ HostCache::~HostCache()
     // 此时 revoke_runtime 应该已经是 true 了 (由 revokeHostRuntime 设置)。
     for (uint64_t i = 0; i < NUM_PREFETCH_THREADS; i++)
     {
-        // 使用 pthread_tryjoin_np 或直接 join，防止重复 join (如果之前逻辑混乱的话)
-        // 这里假设这是唯一 join 的地方
-        int ret = pthread_join(host_prefetch_threads[i], NULL);
-        if (ret != 0)
-            fprintf(stderr, "Join prefetch thread %lu failed/already joined\n", i);
+        int ret = pthread_detach(host_prefetch_threads[i]);
     }
-    this->completion_thread_running.store(false, std::memory_order_release);
+
+    this->prefetchers_exited.store(true, std::memory_order_release);
 
     std::cerr << "Stopping Completion threads...\n";
     // Join 所有 Completion 线程
     for (uint64_t i = 0; i < NUM_COMPLETION_THREADS; i++)
     {
-        int ret = pthread_join(host_completion_threads[i], NULL);
-        if (ret != 0)
-            fprintf(stderr, "Join completion thread %lu failed/already joined\n", i);
+        int ret = pthread_detach(host_completion_threads[i]);
     }
+    this->completion_thread_running.store(false, std::memory_order_release);
 #endif
 
     std::cerr << "All threads stopped safely.\n";
@@ -4695,34 +4812,79 @@ void HostCache::prefetchLoop()
 // }
 // host_cache.h
 
+
 void HostCache::completionLoop(uint64_t worker_id)
 {
-    // 分配队列任务
     std::vector<uint32_t> my_queues;
-    for (uint32_t q = worker_id; q < NUM_NVME_QUEUES; q += NUM_COMPLETION_THREADS) {
+    for (uint32_t q = worker_id; q < NUM_NVME_QUEUES; q += NUM_COMPLETION_THREADS)
+    {
         my_queues.push_back(q);
     }
-
-    printf("Completion Thread %lu serving %lu queues.\n", worker_id, my_queues.size());
 
     while (!revoke_runtime)
     {
         bool did_work = false;
-        for (uint32_t qid : my_queues) {
-            while (process_queue_head(qid)) {
-                did_work = true;
+        for (uint32_t qid : my_queues)
+        {
+            while (true)
+            {
+                int n = process_queue_batch(qid, (int)this->completion_batch_size);
+
+                // 只要处理了数据，就标记为工作过，避免稍后 yield
+                if (n > 0)
+                {
+                    did_work = true;
+                }
+
+                // 如果不足，说明队列空了，跳出内层循环去查下一个队列
+                // 如果等于，说明可能还有积压，继续 while 循环 (贪婪处理)
+                if (n < (int)this->completion_batch_size)
+                {
+                    break;
+                }
             }
         }
-        if (!did_work) std::this_thread::yield();
-    }
-    
-    // 退出前把剩下的处理完
-    for (uint32_t qid : my_queues) {
-        while (process_queue_head(qid));
-    }
-    printf("Completion Thread %lu exited.\n", worker_id);
-}
 
+        if (!did_work)
+            std::this_thread::yield();
+    }
+
+    printf("Completion Thread %lu entering DRAIN phase...\n", worker_id);
+
+    bool pending_work_exists = true;
+    while (!prefetchers_exited.load(std::memory_order_acquire) || pending_work_exists)
+    {
+
+        pending_work_exists = false; // 先假设空了
+
+        for (uint32_t qid : my_queues)
+        {
+            nvm_queue_t *sq = &this->qp[qid]->sq;
+            nvm_queue_t *cq = &this->qp[qid]->cq;
+
+            // 尝试干活
+            int n = process_queue_batch(qid, (int)this->completion_batch_size);
+            if (n > 0)
+                pending_work_exists = true;
+
+            // 检查积压 (Head != Tail)
+            uint32_t head = cq->head.load(simt::memory_order_relaxed);
+            uint32_t tail = sq->tail.load(simt::memory_order_relaxed);
+
+            if (head != tail)
+            {
+                pending_work_exists = true;
+            }
+        }
+
+        if (!pending_work_exists)
+        {
+            std::this_thread::yield();
+        }
+    }
+
+    printf("Completion Thread %lu exited (Drain Complete).\n", worker_id);
+}
 
 #endif // USE_PREFETCH
 
@@ -4957,14 +5119,11 @@ static void *host_flush_page_batch(void *arg)
 static void *start_host_runtime_thread(void *arg)
 {
     fprintf(stderr, "[DEBUG] host_runtime_thread: STARTED. Calling 'new HostCache'.\n");
-    fflush(stderr);
-    host_cache = new HostCache((Controller *)arg, pc_mem_size);
+    host_cache = new HostCache((Controller *)arg, pc_mem_size,completion_batch_size_g);
     // host_cache->setGDSHandler((GDS_HANDLER*)arg);
     fprintf(stderr, "[DEBUG] host_runtime_thread: 'new HostCache' RETURNED. Assigning global ptr.\n");
-    fflush(stderr);
     CPU_PRINT("Start Host Cache Main Loop\n");
     fprintf(stderr, "[DEBUG] host_runtime_thread: Calling launchThreadLoop().\n"); // 关键日志
-    fflush(stderr);
 
 #if PRE_LAUNCH_THREADS
     host_cache->launchThreadLoop();
@@ -5025,11 +5184,12 @@ static void *start_host_completion_thread(void *arg)
 }
 #endif
 
-HostCache *createHostCache(Controller *ctrl, size_t _pc_mem_size)
+HostCache *createHostCache(Controller *ctrl, size_t _pc_mem_size, size_t _batch_size)
 {
     int ret;
 
     pc_mem_size = _pc_mem_size;
+    completion_batch_size_g = _batch_size;
     // GDS_HANDLER* gds_handler = new GDS_HANDLER();
     ret = pthread_create(&host_runtime_thread, NULL, &start_host_runtime_thread, (void *)ctrl);
     if (ret != 0)
@@ -5038,7 +5198,6 @@ HostCache *createHostCache(Controller *ctrl, size_t _pc_mem_size)
     }
 
     fprintf(stderr, "[DEBUG] Main Thread: Waiting in 'while (host_cache == NULL)' loop...\n");
-    fflush(stderr);
     while (host_cache == NULL)
         ;
     // pthread_join(host_runtime_thread, NULL);
@@ -5048,7 +5207,6 @@ HostCache *createHostCache(Controller *ctrl, size_t _pc_mem_size)
     // spin_init();
     // #endif
     fprintf(stderr, "[DEBUG] Main Thread: 'host_cache' pointer is valid. Exiting createHostCache.\n");
-    fflush(stderr);
     CPU_PRINT("Create Host Cache Done!\n");
     return (HostCache *)host_cache;
 }
@@ -5058,7 +5216,6 @@ static void LaunchPrefetchThreads()
 {
     int ret;
     fprintf(stderr, "[DEBUG] Main Thread: ENTERED LaunchPrefetchThreads(). Starting %d + %d prefetch/completion threads...\n", (int)NUM_PREFETCH_THREADS, (int)NUM_COMPLETION_THREADS);
-    fflush(stderr);
     // 启动预取*提交*线程池
     for (uint64_t i = 0; i < NUM_PREFETCH_THREADS; i++)
     {
