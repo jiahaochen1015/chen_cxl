@@ -791,6 +791,132 @@ inline __host__ void cq_dequeue(nvm_queue_t *cq, nvm_queue_host_t *cq_host, uint
     cq_host->pos_locks_h[pos].val.store(0, std::memory_order_release);
 }
 
+// =================================================================================
+// [ADD START] Single-Threaded (ST) Optimization for Unified Worker
+// 用于 1:1 线程队列绑定模式，移除所有原子操作和自旋锁
+// =================================================================================
+
+// 1. 无锁获取 CID (Host Side Only)
+// 由于是单线程独占，直接线性查找即可，无需原子操作
+inline __host__ uint16_t get_cid_st(nvm_queue_host_t *sq_host)
+{
+    // 使用静态变量作为 hint，加速查找
+    static __thread uint16_t last_cid = 0;
+    uint16_t id;
+
+    // 简单的线性探测，尝试找一个空闲 slot
+    for (int i = 0; i < 65536; ++i)
+    {
+        id = (last_cid + i) & 0xFFFF;
+        // 直接读取，因为只有当前线程会修改此状态
+        if (sq_host->cid_h[id].val.load(std::memory_order_relaxed) == UNLOCKED)
+        {
+            sq_host->cid_h[id].val.store(LOCKED, std::memory_order_relaxed);
+            last_cid = (id + 1) & 0xFFFF;
+            return id;
+        }
+    }
+    return 0xFFFF; // Should not happen if queue depth is managed
+}
+
+// 2. 无锁释放 CID
+inline __host__ void put_cid_st(nvm_queue_host_t *sq_host, uint16_t id)
+{
+    sq_host->cid_h[id].val.store(UNLOCKED, std::memory_order_relaxed);
+}
+
+// 3. 无锁提交 SQ
+// 移除了 ticket, tail_mark, tail_lock 等所有多线程同步机制
+inline __host__ uint16_t sq_enqueue_st(nvm_queue_t *sq, nvm_cmd_t *cmd)
+{
+    // 1. 获取当前 tail (本地维护，不需要原子读)
+    uint32_t tail = sq->tail.load(simt::memory_order_relaxed);
+    uint32_t qs_mask = sq->qs_minus_1;
+
+    // 2. 检查队列是否已满 (Head 由硬件/CQ更新，需要原子读 Acquire)
+    uint32_t head = sq->head.load(simt::memory_order_acquire);
+    if (((tail + 1) & qs_mask) == (head & qs_mask))
+    {
+        return 0xFFFF; // Queue Full
+    }
+
+    // 3. 复制命令 (64 bytes)
+    uint64_t *queue_loc = ((uint64_t *)(((nvm_cmd_t *)(sq->vaddr)) + tail));
+    uint64_t *cmd_src = ((uint64_t *)(cmd->dword));
+
+#pragma unroll
+    for (int i = 0; i < 8; i++)
+    {
+        queue_loc[i] = cmd_src[i];
+    }
+
+    // 4. 内存屏障，确保数据在 Doorbell 之前可见
+    _mm_sfence();
+
+    // 5. 更新 Tail (Release)
+    uint32_t new_tail = (tail + 1) & qs_mask;
+    sq->tail.store(new_tail, simt::memory_order_release);
+
+    // 6. 写 Doorbell (MMIO)
+    *(sq->db) = new_tail;
+
+    return (uint16_t)tail;
+}
+
+// 4. 无锁 CQ 批量处理
+// max_batch: 单次最大处理数量
+// completion_cb: 回调函数，处理完成的 CID
+inline __host__ int process_cq_batch_st(nvm_queue_t *cq, nvm_queue_host_t *cq_h,
+                                        nvm_queue_t *sq, nvm_queue_host_t *sq_h,
+                                        int max_batch, std::function<void(uint16_t)> completion_cb)
+{
+    uint32_t head = cq->head.load(simt::memory_order_relaxed);
+    uint32_t qs_mask = cq->qs_minus_1;
+    uint32_t qs_log2 = cq->qs_log2;
+    int processed = 0;
+
+    for (int i = 0; i < max_batch; ++i)
+    {
+        uint32_t loc = head & qs_mask;
+        volatile nvm_cpl_t *cpl = &((nvm_cpl_t *)cq->vaddr)[loc];
+
+        // 检查 Phase Bit
+        uint32_t cpl_dw3 = cpl->dword[3];
+        uint32_t phase = (cpl_dw3 & 0x00010000) >> 16;
+        uint32_t expected_phase = ((~(head >> qs_log2)) & 0x01);
+
+        if (phase != expected_phase)
+            break; // 队列空，没有新完成项
+
+        // 获取 CID
+        uint16_t cid = (uint16_t)(cpl_dw3 & 0xFFFF);
+
+        // 获取 SQ Head 指针更新 (硬件回写)
+        uint16_t sq_head = (uint16_t)(cpl->dword[2] & 0xFFFF);
+        sq->head.store(sq_head, simt::memory_order_release);
+
+        // 回调上层逻辑处理
+        completion_cb(cid);
+
+        // 释放 CID
+        put_cid_st(sq_h, cid);
+
+        head++;
+        processed++;
+    }
+
+    if (processed > 0)
+    {
+        // 更新 CQ Head
+        cq->head.store(head, simt::memory_order_release);
+        // 写 CQ Doorbell
+        *(cq->db) = (head & qs_mask);
+    }
+
+    return processed;
+}
+// [ADD END]
+
 // #ifndef __CUDACC__
 // #undef __device__
 // #undef __host__

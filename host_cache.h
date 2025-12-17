@@ -29,7 +29,8 @@
 #include <curand_kernel.h>
 #include <nvm_admin.h>
 #include <numa.h>
-
+#include <sched.h>
+#include <pthread.h>
 /* Utility */
 #define DIV_ROUND_UP(n, d) (((n) + (d) - 1) / (d))
 #define UNUSED(x) (void)(x)
@@ -163,7 +164,7 @@
 /* Data Structures Constants */
 #define GPU_OPEN_FILE_TABLE_SIZE 128
 #define GPU_RW_SIZE_DEMAND (8ULL << 10)
-#define GPU_RW_SIZE_PREFETCH (128ULL << 10)
+#define GPU_RW_SIZE_PREFETCH (256ULL << 10)
 #define GPU_RW_SIZE GPU_RW_SIZE_DEMAND
 #define FILENAME_SIZE 128
 
@@ -849,6 +850,13 @@ public:
 #if USE_PREFETCH
     void prefetchLoop(); // 新增: Host 端预取循环函数
     void completionLoop(uint64_t worker_id);
+
+    // 启动 Unified Worker
+    void LaunchUnifiedWorkers();
+
+    // Unified I/O 循环逻辑
+    void unifiedIOLoop(uint64_t worker_id);
+
 #endif
     void launchThreadLoop();
     void threadLoop(int);
@@ -968,6 +976,14 @@ public:
     std::atomic<uint32_t> global_prefetch_qid;
     PrefetchShard outstanding_shards[NUM_COMPLETION_THREADS];
     std::atomic<bool> completion_thread_running;
+
+    // Unified Worker 线程池
+    std::vector<std::thread> unified_worker_threads;
+    // 线程本地元数据定义 (CID -> Info)
+    struct ThreadLocalMetadata
+    {
+        PrefetchCompletionInfo pending_ios[65536];
+    };
 #endif
     std::atomic<int64_t> pending_reqs_num;
 
@@ -3512,43 +3528,6 @@ HostCache::HostCache(Controller *_ctrl, uint64_t _gpu_mem_size
 #endif
     cudaFree(gpu_buff);
     fprintf(stderr, "cudaMemcpyAsync test for host mem is good.\n");
-    // Write data test
-
-    // memset((void*)NVM_PTR_OFFSET(host_mem, PAGE_SIZE, 0), 'X', PAGE_SIZE);
-    // write_data_from_hc(this, 0, PAGE_SIZE/512, 0, 0);
-    // memset((void*)NVM_PTR_OFFSET(host_mem, PAGE_SIZE, 1), 'Y', PAGE_SIZE);
-    // write_data_from_hc(this, 128, PAGE_SIZE/512, 1, 1 % NUM_NVME_QUEUES);
-    // memset((void*)NVM_PTR_OFFSET(host_mem, PAGE_SIZE, 2), 'Z', PAGE_SIZE);
-    // write_data_from_hc(this, 256, PAGE_SIZE/512, 2, 2 % NUM_NVME_QUEUES);
-    // memset((void*)NVM_PTR_OFFSET(host_mem, PAGE_SIZE, 3), 'A', PAGE_SIZE);
-    // write_data_from_hc(this, 384, PAGE_SIZE/512, 3, 3 % NUM_NVME_QUEUES);
-    // memset((void*)NVM_PTR_OFFSET(host_mem, PAGE_SIZE, 4), 'B', PAGE_SIZE);
-    // write_data_from_hc(this, 512, PAGE_SIZE/512, 4, 4 % NUM_NVME_QUEUES);
-    // memset((void*)NVM_PTR_OFFSET(host_mem, PAGE_SIZE, 5), 'C', PAGE_SIZE);
-    // write_data_from_hc(this, 640, PAGE_SIZE/512, 5, 5 % NUM_NVME_QUEUES);
-    // fprintf(stderr, "write_data_from_hc to SSD test for host mem is good.\n");
-
-    // read_data_to_hc(this, 0, PAGE_SIZE/512, 6);
-    // read_data_to_hc(this, 128, PAGE_SIZE/512, 7);
-    // read_data_to_hc(this, 256, PAGE_SIZE/512, 8);
-    // read_data_to_hc(this, 384, PAGE_SIZE/512, 9);
-    // read_data_to_hc(this, 512, PAGE_SIZE/512, 10);
-    // read_data_to_hc(this, 640, PAGE_SIZE/512, 11);
-    // for (int i = 0; i < PAGE_SIZE; i++) {
-    //     if (*((unsigned char*)NVM_PTR_OFFSET(host_mem, PAGE_SIZE, 6) + i) != 'X' ||
-    //         *((unsigned char*)NVM_PTR_OFFSET(host_mem, PAGE_SIZE, 7) + i) != 'Y' ||
-    //         *((unsigned char*)NVM_PTR_OFFSET(host_mem, PAGE_SIZE, 8) + i) != 'Z' ||
-    //         *((unsigned char*)NVM_PTR_OFFSET(host_mem, PAGE_SIZE, 9) + i) != 'A' ||
-    //         *((unsigned char*)NVM_PTR_OFFSET(host_mem, PAGE_SIZE, 10) + i) != 'B' ||
-    //         *((unsigned char*)NVM_PTR_OFFSET(host_mem, PAGE_SIZE, 11) + i) != 'C'
-    //         ) {
-    //         fprintf(stderr, "read_data_to_hc failed!\n");
-    //         exit(1);
-    //     }
-    // }
-    // printf("\n");
-    // fprintf(stderr, "read_data_to_hc to SSD test for host mem is good.\n");
-
 #endif
     fprintf(stderr, "[DEBUG] HostCache Constructor: COMPLETED.\n");
 
@@ -3592,7 +3571,6 @@ HostCache::~HostCache()
         std::cout << "Wait Success Rate        : " << (double)successes / waits * 100.0 << "%" << std::endl;
     }
 
-    // ================= [FIX START: 停止并回收所有子线程] =================
     if (!cpu_worker_threads.empty())
     {
         std::cerr << "Joining CPU worker threads...\n";
@@ -3607,6 +3585,7 @@ HostCache::~HostCache()
         std::cerr << "CPU worker threads joined.\n";
     }
 
+//回收P/C线程逻辑
 #if USE_PREFETCH
     std::cerr << "Stopping Prefetch threads...\n";
 
@@ -3630,18 +3609,13 @@ HostCache::~HostCache()
 #endif
 
     std::cerr << "All threads stopped safely.\n";
-    // ================= [FIX END] =================
 
     // 停止 MemSampleCollector
     if (this->mem_sample_collector)
     {
         std::cerr << "Stopping MemSampleCollector...\n";
-        // 设置标志位，让 collector_thread 跳出循环
         this->mem_sample_collector->leaving = true;
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        // MemSampleCollector 的析构函数如果包含 thread.join() 最好，
-        // 如果没有，我们至少保证了它能退出循环。
-        // 这里显式 delete 会触发它的析构。
         delete this->mem_sample_collector;
         this->mem_sample_collector = NULL;
         std::cerr << "Stopped MemSampleCollector.\n";
@@ -4618,52 +4592,6 @@ void HostCache::prefetchLoop()
                         std::lock_guard<std::mutex> lock(outstanding_shards[shard_idx].shard_mutex);
                         outstanding_shards[shard_idx].outstanding_map[cid] = info;
                     }
-
-                    // //--------------------------------同步读取--------------------------------
-                    // uint64_t starting_lba = get_lba(this, key);
-                    // // 确保 queue_id 映射到配置的 Host 队列 (例如 QID 2 对应数组索引 0)
-                    // // 如果你用了 --num_queues 1，Host 只有一个队列，所以 % 1 = 0，是安全的
-                    // uint32_t queue_id = original_queue_index % NUM_NVME_QUEUES;
-
-                    // // 1. 设置状态防止被驱逐
-                    // host_cache_state[_bid].tag = key;
-                    // host_cache_state[_bid].state.store(HOST_CACHE_ENTRY_PREFETCHING, simt::std::memory_order_relaxed);
-
-                    // // 释放 T2 锁，允许 DMA 写入
-                    // host_cache_state[_bid].lock.store(HOST_CACHE_ENTRY_UNLOCKED, simt::std::memory_order_release);
-
-                    // // 2. [核心修改] 同步读取！(阻塞直到 SSD 完成)
-                    // // 这会内部调用 sq_enqueue -> _mm_sfence -> doorbell -> cq_poll -> cq_dequeue
-                    // // fprintf(stderr, "[Debug] T2 Prefetch Start: Key %lu -> Bid %lu\n", key, _bid);
-                    // read_data_to_hc(this, starting_lba, PAGE_SIZE / 512, _bid, queue_id);
-                    // // fprintf(stderr, "[Debug] DONE: Key %lu -> Bid %lu\n", key, _bid);
-                    // uint64_t* ptr = (uint64_t*)NVM_PTR_OFFSET(this->host_mem, PAGE_SIZE, _bid);
-                    // // if (ptr[0] == 0 && ptr[1] == 0 && ptr[2] == 0)
-                    // // {
-                    // //     fprintf(stderr, "[WARN] T2 Slot %lu appears empty after read! Key %lu\n", _bid, key);
-                    // // }
-                    // // 3. [立即完成] I/O 返回即代表成功
-                    // // 更新 T2 状态为 VALID
-                    // host_cache_state[_bid].is_dirty = false;
-                    // host_cache_state[_bid].state.store(HOST_CACHE_ENTRY_VALID, simt::std::memory_order_release);
-
-                    // // 更新统计
-                    // if (replaced_invalid_slot)
-                    // {
-                    //     valid_entry_count.fetch_add(1, std::memory_order_acquire);
-                    //     __atomic_sub_fetch(num_idle_slots_h, 1, __ATOMIC_SEQ_CST);
-                    // }
-
-                    // // 释放 T2 锁 (虽然 read_data_to_hc 期间没锁，但为了逻辑闭环，这里通常不需要额外操作，
-                    // // 因为上面已经是 UNLOCKED 了。但如果有其他逻辑依赖锁，请注意)
-
-                    // // 4. 释放 GPU 请求队列槽位
-                    // // 告诉 GPU：这个预取请求处理完了 (状态复位为空，等待下一个请求)
-                    // // 注意：GPU 预取是 Fire-and-Forget，它不等待 READY，所以设为 EMPTY 即可
-                    // this->host_rw_queue_prefetch->entries[original_queue_index].status = GPU_RW_EMPTY;
-                    // this->host_rw_manager_prefetch->entry_lock[original_queue_index] = GPU_NO_LOCKED;
-                    // __sync_synchronize();
-                    // //--------------------------------------------------------------------------------
                 }
                 else
                 {
@@ -4687,10 +4615,11 @@ void HostCache::prefetchLoop()
     }
 }
 
-// void HostCache::completionLoop(uint64_t worker_id)
-// {
-//     // 获取此 worker 线程*专属*的分片
-//     PrefetchShard &my_shard = outstanding_shards[worker_id];
+// 单次敲击doorbell的completion loop（v1）
+//  void HostCache::completionLoop(uint64_t worker_id)
+//  {
+//      // 获取此 worker 线程*专属*的分片
+//      PrefetchShard &my_shard = outstanding_shards[worker_id];
 
 //     // 用于临时存储*此工作线程*要处理的条目，以避免在 I/O 期间锁住 map
 //     std::vector<uint16_t> cids_to_poll;
@@ -4812,7 +4741,7 @@ void HostCache::prefetchLoop()
 // }
 // host_cache.h
 
-
+// batch的处理doorbell的completionloop（v2）
 void HostCache::completionLoop(uint64_t worker_id)
 {
     std::vector<uint32_t> my_queues;
@@ -5119,7 +5048,7 @@ static void *host_flush_page_batch(void *arg)
 static void *start_host_runtime_thread(void *arg)
 {
     fprintf(stderr, "[DEBUG] host_runtime_thread: STARTED. Calling 'new HostCache'.\n");
-    host_cache = new HostCache((Controller *)arg, pc_mem_size,completion_batch_size_g);
+    host_cache = new HostCache((Controller *)arg, pc_mem_size, completion_batch_size_g);
     // host_cache->setGDSHandler((GDS_HANDLER*)arg);
     fprintf(stderr, "[DEBUG] host_runtime_thread: 'new HostCache' RETURNED. Assigning global ptr.\n");
     CPU_PRINT("Start Host Cache Main Loop\n");
