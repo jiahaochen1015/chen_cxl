@@ -3711,6 +3711,19 @@ HostCache::~HostCache()
         std::cerr << "Deleted NVME Queue " << i << ".\n";
     }
 
+    // Free per-queue host allocations attached to cq_host
+    if (this->cq_host)
+    {
+        for (uint32_t i = 0; i < this->cfg_num_nvme_queues; i++)
+        {
+            if (this->cq_host[i].pos_locks_h)
+            {
+                free(this->cq_host[i].pos_locks_h);
+                this->cq_host[i].pos_locks_h = nullptr;
+            }
+        }
+    }
+
     delete[] this->qp;
     this->qp = nullptr;
     delete[] this->sq_host;
@@ -5548,6 +5561,19 @@ HostCache *createHostCache(Controller *ctrl, size_t _pc_mem_size, size_t _batch_
                            uint32_t n_queues, uint32_t q_entries, uint32_t spin_thresh)
 {
     int ret;
+
+    // Defensive: avoid divide-by-zero and invalid queue allocations.
+    // (Many code paths modulo by cfg_num_nvme_queues.)
+    if (n_queues == 0)
+    {
+        fprintf(stderr, "WARN: n_queues=0 is invalid; clamping to 1.\n");
+        n_queues = 1;
+    }
+    if (q_entries == 0)
+    {
+        fprintf(stderr, "WARN: host_queue_entries=0 is invalid; clamping to 1.\n");
+        q_entries = 1;
+    }
 
     pc_mem_size = _pc_mem_size;
     completion_batch_size_g = _batch_size;
