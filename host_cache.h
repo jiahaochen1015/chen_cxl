@@ -1619,9 +1619,9 @@ public:
     uint32_t large_rd = 0;
 };
 
-HostCache *createHostCache(Controller *ctrl);
-HostCache *createHostCache(Controller *ctrl, size_t _pc_mem_size, size_t _batch_size,
-                           uint32_t n_queues, uint32_t q_entries, uint32_t spin_thresh);
+static inline HostCache *createHostCache(Controller *ctrl);
+static inline HostCache *createHostCache(Controller *ctrl, size_t _pc_mem_size, size_t _batch_size,
+                                         uint32_t n_queues, uint32_t q_entries, uint32_t spin_thresh);
 void revokeHostRuntime();
 void preLoadData(int fd, size_t page_size);
 // void registerGPUMem(void*, size_t);
@@ -5557,8 +5557,8 @@ static void *start_host_completion_thread(void *arg)
 }
 #endif
 
-HostCache *createHostCache(Controller *ctrl, size_t _pc_mem_size, size_t _batch_size,
-                           uint32_t n_queues, uint32_t q_entries, uint32_t spin_thresh)
+static inline HostCache *createHostCache(Controller *ctrl, size_t _pc_mem_size, size_t _batch_size,
+                                         uint32_t n_queues, uint32_t q_entries, uint32_t spin_thresh)
 {
     int ret;
 
