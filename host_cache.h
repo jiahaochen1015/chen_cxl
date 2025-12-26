@@ -12,12 +12,14 @@
 #include "queue.h"
 #include "host_ring_buffer.h"
 #include "linear_regression.h"
+#include "debug_profiler.h"
 #include <thread>
 #include <vector>
 #include <map>
 #include <fstream>
 #include <unordered_map>
 #include <simt/atomic>
+#include <atomic>
 #include <mutex>
 #include <fcntl.h>
 #include <sstream>
@@ -32,7 +34,10 @@
 #include <sched.h>
 #include <pthread.h>
 #include <emmintrin.h>
-/* Utility */
+
+// 定义全局计数器
+static std::atomic<uint64_t> global_dropped_prefetch_count(0);
+
 #define DIV_ROUND_UP(n, d) (((n) + (d) - 1) / (d))
 #define UNUSED(x) (void)(x)
 #define CUDA_SAFE_CALL(x)                                                                                      \
@@ -119,31 +124,30 @@
 // 我们要保证可以使用零拷贝来进行数据传输，因为有预取是需要t3->t2的零拷贝传输的
 #define USER_SPACE_ZERO_COPY 1
 
-
-
 /*----------------------------------------------------------------------------*/
 /*预取相关宏*/
 // 预取功能开关：设置为 1 启用预取，设置为 0 禁用预取
 #define USE_PREFETCH 1
+#define PROFILE_PREFETCH 0
+#define PREFETCH_DEBUG 1
 // // 定义并发预取 I/O 的*提交*线程数量
 // #define NUM_PREFETCH_THREADS 1
 // // 定义并发*完成* I/O 的线程数量
 // #define NUM_COMPLETION_THREADS 1
-#define PREFETCH_RING_SIZE 1024 * 128
+#define PREFETCH_RING_SIZE (1024 * 128)
 #define PREFETCH_RING_MASK (PREFETCH_RING_SIZE - 1)
 #define CACHE_LINE_SIZE 64
-#define PREFETCH_DEBUG 1
 // #define NUM_NVME_QUEUES 4
 // #define HOST_QUEUE_NUM_ENTRIES 2048
 // #define SPIN_COUNT_THRESHOLD 16384
 #define GPU_RW_SIZE_DEMAND (8ULL << 10)
-#define GPU_RW_SIZE_PREFETCH (32ULL << 10)
+#define GPU_RW_SIZE_PREFETCH (512ULL << 10)
 #define GPU_RW_SIZE GPU_RW_SIZE_DEMAND
+
+// chenjiahao 主机端内存容量
+#define HOST_MEM_SIZE ((size_t)1024UL * (size_t)1024 * (size_t)1024 * (size_t)32)
+
 /*----------------------------------------------------------------------------*/
-
-
-
-
 
 #if 0
 #include <assert.h>
@@ -207,8 +211,6 @@
 //  #warning "Graph Workloads...!"
 //  #define HOST_MEM_SIZE ((size_t)1024UL*(size_t)1024*(size_t)1024*(size_t)16)
 //  #else
-// chenjiahao 主机端内存容量
-#define HOST_MEM_SIZE ((size_t)1024UL * (size_t)1024 * (size_t)1024 * (size_t)32)
 // #endif
 #define HOST_MEM_NUM_PAGES (HOST_MEM_SIZE / PAGE_SIZE)
 
@@ -1747,6 +1749,8 @@ inline bool find_reuse_page(uint64_t key, int64_t &pos)
     }
     return false;
 }
+
+#if USE_PREFETCH
 // 它只提交 NVMe 读命令并立即返回 CID，*不会*阻塞等待
 inline uint16_t HostCache::submit_read_data_to_hc_async(const uint64_t starting_lba, const uint64_t n_blocks, const unsigned long long hc_entry, uint32_t queue_id = 0)
 {
@@ -1775,6 +1779,11 @@ inline uint16_t HostCache::submit_read_data_to_hc_async_st(const uint64_t starti
                                                            const unsigned long long hc_entry,
                                                            uint32_t queue_id)
 {
+#if PROFILE_PREFETCH
+    // [NSYS] 标记 IO 提交过程 (构建命令 + 写寄存器)
+    PROFILE_SCOPE("IO::Submit_Routine", GMT_Color::IO_SUBMIT);
+#endif
+
     // 1. 获取 CID (无锁，Thread-Local 优化)
     // 注意：get_cid_st 需要传入 queue_host 指针
     uint16_t cid = get_cid_st(&(this->sq_host[queue_id]));
@@ -1782,6 +1791,14 @@ inline uint16_t HostCache::submit_read_data_to_hc_async_st(const uint64_t starti
     // 理论上如果 CID 耗尽会死锁，但在这种 1:1 模型且 QueueDepth < 65536 时极少发生
     if (cid == 0xFFFF)
         return 0xFFFF;
+
+#if PROFILE_PREFETCH
+    // =========================================================
+    // [NSYS 关键] 开启异步追踪：SSD 物理读取开始
+    // =========================================================
+    TRACE_IO_START("NVMe_Read_SSD", cid);
+    // =========================================================
+#endif
 
     // 2. 构建命令
     nvm_cmd_t cmd;
@@ -1918,6 +1935,7 @@ int HostCache::process_queue_batch(uint32_t queue_id, int max_batch)
 }
 
 /*------------------------------------------------------------------------------------------------------------------------*/
+#endif // USE_PREFETCH
 inline void read_data_to_hc(HostCache *hc, const uint64_t starting_lba, const uint64_t n_blocks, const unsigned long long hc_entry, uint32_t queue_id = 0)
 {
     nvm_cmd_t cmd;
@@ -3244,10 +3262,10 @@ __global__ void verify(void *ptr)
 
 HostCache::HostCache(Controller *_ctrl, uint64_t _gpu_mem_size, uint64_t _batch_size,
                      uint32_t n_queues, uint32_t q_entries, uint32_t spin_thresh)
-    : cfg_num_nvme_queues(n_queues), cfg_host_queue_entries(q_entries), cfg_spin_threshold(spin_thresh)
-    , ctrl(_ctrl), gpu_mem_size(_gpu_mem_size), prefetchers_exited(false)
+    : cfg_num_nvme_queues(n_queues), cfg_host_queue_entries(q_entries), cfg_spin_threshold(spin_thresh), ctrl(_ctrl), gpu_mem_size(_gpu_mem_size), prefetchers_exited(false)
 #if USE_PREFETCH
-    , completion_batch_size(_batch_size)
+      ,
+      completion_batch_size(_batch_size)
 #endif
 {
     // INIT_SHARED_MEM_PTR(GpuOpenFileTable, this->host_open_table, gpu_open_table);
@@ -3493,9 +3511,9 @@ HostCache::HostCache(Controller *_ctrl, uint64_t _gpu_mem_size, uint64_t _batch_
         CUDA_SAFE_CALL(cudaHostGetDevicePointer((void **)(&tmp_ptr), (void *)host_mem, 0));
         CUDA_SAFE_CALL(cudaMemcpyToSymbol(host_cache_base, &tmp_ptr, sizeof(void *)));
     }
-// #endif
+    // #endif
 
-/* Queue Pair for Host Cache */
+    /* Queue Pair for Host Cache */
     // this->qp = new QueuePair(_ctrl->ctrl, _ctrl->ns, _ctrl->info, _ctrl->aq_ref, _ctrl->n_qps+1, HOST_QUEUE_NUM_ENTRIES);
     this->qp = new QueuePair *[this->cfg_num_nvme_queues];
     for (uint32_t i = 0; i < this->cfg_num_nvme_queues; i++)
@@ -3601,10 +3619,12 @@ HostCache::~HostCache()
     std::cout << "[Prefetch Instrumentation]" << std::endl;
     std::cout << "Total Prefetch Waits     : " << waits << std::endl;
     std::cout << "Total Wait Successes     : " << successes << std::endl;
+    std::cout << "Total DROPPED Prefetches : " << global_dropped_prefetch_count.load() << " (Due to T2 Full)" << std::endl;
     if (waits > 0)
     {
         std::cout << "Wait Success Rate        : " << (double)successes / waits * 100.0 << "%" << std::endl;
     }
+    std::cout << "------------------------------------------------" << std::endl;
 
     if (!cpu_worker_threads.empty())
     {
@@ -3766,6 +3786,11 @@ static inline void cpu_relax()
 
 void HostCache::handleRequest(int queue_index)
 {
+#if PROFILE_PREFETCH
+    // [NSYS] 标记 Demand 请求处理入口
+    PROFILE_SCOPE("Demand::Handle_Entry", GMT_Color::FETCH_ROUTINE);
+#endif
+
     uint32_t type = this->host_rw_queue->entries[queue_index].type;
     uint64_t key = this->host_rw_queue->entries[queue_index].key;
 #if USE_PINNED_MEM
@@ -4064,6 +4089,10 @@ void HostCache::handleRequest(int queue_index)
 
         // [步骤 1: 使用 Key 和 O(1) 分区 map 查找]
         {
+#if PROFILE_PREFETCH
+            // [NSYS] 查表阶段
+            PROFILE_SCOPE("Fetch::Map_Lookup", GMT_Color::FETCH_LOOKUP);
+#endif
             uint32_t shard_idx = get_t2_shard_idx(key);
             std::lock_guard<std::mutex> lock(t2_map_mutexes[shard_idx]); // 锁住该分片
 
@@ -4099,40 +4128,45 @@ void HostCache::handleRequest(int queue_index)
                 total_prefetch_waits.fetch_add(1, std::memory_order_relaxed);
             }
 
-            int spin_count = 0;
-            while (true)
+            // [NSYS 关键] 等待预取完成 (Wait Prefetch)
+            // 这条红线越长，说明 SSD 越慢
             {
-                uint32_t s = host_cache_state[_bid].state.load(simt::std::memory_order_acquire);
-                // 1. 如果 Tag 变了，说明槽位被回收了，停止等待
-                if (host_cache_state[_bid].tag != key)
-                    break;
-                // 2. 如果状态是 PREFETCHING，继续等待
-                if (s == HOST_CACHE_ENTRY_PREFETCHING)
+#if PROFILE_PREFETCH
+                PROFILE_SCOPE("Fetch::Wait_Prefetch", GMT_Color::FETCH_WAIT);
+#endif
+                int spin_count = 0;
+                while (true)
                 {
-                    waited = true;
-                    // if (spin_count < 1024)
-                    // {
-                    //     cpu_relax(); // 自旋等待
-                    // }
-                    // else
-                    // {
-                    //     usleep(1); // 超过一定次数让出 CPU，避免死锁系统
-                    // }
-                    spin_count++;
-
-                    // if (spin_count > this->cfg_spin_threshold)
-                    //     break;
-                }
-                else
-                {
-
-                    
-                    if (waited && s == HOST_CACHE_ENTRY_VALID)
+                    uint32_t s = host_cache_state[_bid].state.load(simt::std::memory_order_acquire);
+                    // 1. 如果 Tag 变了，说明槽位被回收了，停止等待
+                    if (host_cache_state[_bid].tag != key)
+                        break;
+                    // 2. 如果状态是 PREFETCHING，继续等待
+                    if (s == HOST_CACHE_ENTRY_PREFETCHING)
                     {
-                        total_prefetch_wait_successes.fetch_add(1, std::memory_order_relaxed);
+                        waited = true;
+                        // if (spin_count < 1024)
+                        // {
+                        //     cpu_relax(); // 自旋等待
+                        // }
+                        // else
+                        // {
+                        //     usleep(1); // 超过一定次数让出 CPU，避免死锁系统
+                        // }
+                        spin_count++;
+
+                        if (spin_count > this->cfg_spin_threshold)
+                            break;
                     }
-                    // 3. 状态已变为 VALID (完成) 或 INVALID (失败)，退出循环
-                    break;
+                    else
+                    {
+                        if (waited && s == HOST_CACHE_ENTRY_VALID)
+                        {
+                            total_prefetch_wait_successes.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        // 3. 状态已变为 VALID (完成) 或 INVALID (失败)，退出循环
+                        break;
+                    }
                 }
             }
 
@@ -4159,9 +4193,15 @@ void HostCache::handleRequest(int queue_index)
                 uint32_t lock = host_cache_state[_bid].lock.load(simt::std::memory_order_relaxed);
                 if (lock == HOST_CACHE_ENTRY_UNLOCKED)
                 {
-
-                    uint32_t state = host_cache_state[_bid].state.load(simt::std::memory_order_acquire);
-                    lock = host_cache_state[_bid].lock.exchange(HOST_CACHE_ENTRY_LOCKED, simt::std::memory_order_acquire);
+                    uint32_t state;
+                    {
+#if PROFILE_PREFETCH
+                        // [NSYS] 获取 Slot 锁
+                        PROFILE_SCOPE("Fetch::Lock_Slot", GMT_Color::FETCH_SLOT_LK);
+#endif
+                        state = host_cache_state[_bid].state.load(simt::std::memory_order_acquire);
+                        lock = host_cache_state[_bid].lock.exchange(HOST_CACHE_ENTRY_LOCKED, simt::std::memory_order_acquire);
+                    }
                     /* Get the lock of this entry */
                     if (lock == HOST_CACHE_ENTRY_UNLOCKED)
                     {
@@ -4182,15 +4222,21 @@ void HostCache::handleRequest(int queue_index)
                         {
                             /* Start to transfer from host to GPU */
                             // fprintf(stderr, "fetch from host: start transfer for key %lu\n", key);
-#if MULTI_DATA_STREAM
-                            cudaMemcpyAsync((void *)gpu_addr, (const void *)NVM_PTR_OFFSET(host_mem, PAGE_SIZE, _bid), PAGE_SIZE,
-                                            cudaMemcpyHostToDevice, stream_mngr->data_stream_to_device[queue_index % NUM_DATA_STREAMS]);
-                            cudaStreamSynchronize(stream_mngr->data_stream_to_device[queue_index % NUM_DATA_STREAMS]);
-#else
-                            cudaMemcpyAsync((void *)gpu_addr, (const void *)NVM_PTR_OFFSET(host_mem, PAGE_SIZE, _bid), PAGE_SIZE,
-                                            cudaMemcpyHostToDevice, stream_mngr->data_stream_to_device);
-                            cudaStreamSynchronize(stream_mngr->data_stream_to_device);
+                            {
+#if PROFILE_PREFETCH
+                                // [NSYS] 数据拷贝 (H2D)
+                                PROFILE_SCOPE("Fetch::H2D_Copy", GMT_Color::FETCH_COPY);
 #endif
+#if MULTI_DATA_STREAM
+                                cudaMemcpyAsync((void *)gpu_addr, (const void *)NVM_PTR_OFFSET(host_mem, PAGE_SIZE, _bid), PAGE_SIZE,
+                                                cudaMemcpyHostToDevice, stream_mngr->data_stream_to_device[queue_index % NUM_DATA_STREAMS]);
+                                cudaStreamSynchronize(stream_mngr->data_stream_to_device[queue_index % NUM_DATA_STREAMS]);
+#else
+                                cudaMemcpyAsync((void *)gpu_addr, (const void *)NVM_PTR_OFFSET(host_mem, PAGE_SIZE, _bid), PAGE_SIZE,
+                                                cudaMemcpyHostToDevice, stream_mngr->data_stream_to_device);
+                                cudaStreamSynchronize(stream_mngr->data_stream_to_device);
+#endif
+                            }
                             // fprintf(stderr, "fetch from host: start transfer for key %lu done\n", key);
                             fail = false;
 
@@ -4507,12 +4553,20 @@ void HostCache::prefetchLoop()
                 if (it != t2_key_to_bid_maps[shard_idx].end())
                 {
                     uint64_t found_bid = it->second;
-                    if (found_bid < this->num_pages && host_cache_state[found_bid].tag == key && host_cache_state[found_bid].state.load(simt::std::memory_order_acquire) == HOST_CACHE_ENTRY_VALID)
+
+                    // [FIX START] 读取当前状态
+                    uint32_t current_state = host_cache_state[found_bid].state.load(simt::std::memory_order_acquire);
+
+                    // 允许 VALID 或 PREFETCHING
+                    if (found_bid < this->num_pages &&
+                        host_cache_state[found_bid].tag == key &&
+                        (current_state == HOST_CACHE_ENTRY_VALID || current_state == HOST_CACHE_ENTRY_PREFETCHING))
                     {
-                        already_in_t2 = true;
+                        already_in_t2 = true; // 判定为已存在，跳过本次请求
                     }
                     else
                     {
+                        // 只有当 Tag 不匹配，或者状态是 INVALID/其它奇怪状态时才删除
                         t2_key_to_bid_maps[shard_idx].erase(it);
                     }
                 }
@@ -4663,6 +4717,9 @@ void HostCache::prefetchLoop()
                     //                     fprintf(stderr, "[Prefetch-Submit] [Q: %u] T2 full/busy. DROPPING request for key 0x%lx.\n", original_queue_index, key);
                     // #endif
 
+                    // 仅计数，不要 fprintf
+                    global_dropped_prefetch_count.fetch_add(1, std::memory_order_relaxed);
+
                     // TODO:这里是ready还是empty？
                     this->host_rw_queue_prefetch->entries[original_queue_index].u.CacheReq.return_code = HOST_CACHE_FETCH_FAILED;
                     this->host_rw_queue_prefetch->entries[original_queue_index].status = GPU_RW_EMPTY;
@@ -4706,6 +4763,11 @@ void HostCache::prefetchLoop(uint64_t worker_id)
 
         if (q_entries[queue_index].status == GPU_RW_PENDING)
         {
+#if PROFILE_PREFETCH
+            // [NSYS] 处理一个预取请求
+            PROFILE_SCOPE("Prefetch::Process_Req", GMT_Color::PREFETCH_PROCESS);
+#endif
+
             // 移除 global_prefetch_qid CAS 抢占逻辑
             // 因为静态分区保证了只有本线程会处理这个 queue_index，无需抢锁
 
@@ -4718,20 +4780,30 @@ void HostCache::prefetchLoop(uint64_t worker_id)
 
             // --- 逻辑块：检查 T2 是否已存在 (保持原逻辑，因为 T2 Map 是共享的，锁必须保留) ---
             {
+#if PROFILE_PREFETCH
+                // [NSYS] 查表检查 (T2 Check)
+                PROFILE_SCOPE("Prefetch::Map_Lookup", GMT_Color::PREFETCH_LOCK);
+#endif
                 uint32_t shard_idx = get_t2_shard_idx(key);
                 std::lock_guard<std::mutex> lock(t2_map_mutexes[shard_idx]);
                 auto it = t2_key_to_bid_maps[shard_idx].find(key);
                 if (it != t2_key_to_bid_maps[shard_idx].end())
                 {
                     uint64_t found_bid = it->second;
+
+                    // [FIX START] 读取当前状态
+                    uint32_t current_state = host_cache_state[found_bid].state.load(simt::std::memory_order_acquire);
+
+                    // 允许 VALID 或 PREFETCHING
                     if (found_bid < this->num_pages &&
                         host_cache_state[found_bid].tag == key &&
-                        host_cache_state[found_bid].state.load(simt::std::memory_order_acquire) == HOST_CACHE_ENTRY_VALID)
+                        (current_state == HOST_CACHE_ENTRY_VALID || current_state == HOST_CACHE_ENTRY_PREFETCHING))
                     {
-                        already_in_t2 = true;
+                        already_in_t2 = true; // 判定为已存在，跳过本次请求
                     }
                     else
                     {
+                        // 只有当 Tag 不匹配，或者状态是 INVALID/其它奇怪状态时才删除
                         t2_key_to_bid_maps[shard_idx].erase(it);
                     }
                 }
@@ -4809,7 +4881,7 @@ void HostCache::prefetchLoop(uint64_t worker_id)
                             break;
                         }
                         _bid = (_bid + 1) % HOST_MEM_NUM_PAGES;
-                    } while (_bid != start_bid);
+                    } while (_bid != start_bid); // 只在t2里扫一遍
                 }
 
                 // --- 逻辑块：提交 I/O (核心修改部分) ---
@@ -4825,9 +4897,9 @@ void HostCache::prefetchLoop(uint64_t worker_id)
                     // 使用 _st (Single Threaded) 无锁提交函数
                     // 使用 do-while 处理队列满 (Queue Full) 的情况
                     uint16_t cid = 0xFFFF;
+
                     do
                     {
-                        // 这里的 my_queue_id 是固定的，没有任何锁竞争
                         cid = submit_read_data_to_hc_async_st(starting_lba, PAGE_SIZE / 512, _bid, my_queue_id);
                     } while (cid == 0xFFFF);
 
@@ -4854,6 +4926,10 @@ void HostCache::prefetchLoop(uint64_t worker_id)
                 else
                 {
                     // T2 满了，丢弃请求
+
+                    // [PATCH 2] 仅计数，不要 fprintf
+                    global_dropped_prefetch_count.fetch_add(1, std::memory_order_relaxed);
+
                     q_entries[queue_index].u.CacheReq.return_code = HOST_CACHE_FETCH_FAILED;
                     q_entries[queue_index].status = GPU_RW_EMPTY; // 设为 EMPTY 让 GPU 可重用
                     this->host_rw_manager_prefetch->entry_lock[queue_index] = GPU_NO_LOCKED;
@@ -5184,7 +5260,9 @@ void HostCache::completionLoop(uint64_t worker_id)
         {
             continue;
         }
-
+#if PROFILE_PREFETCH
+        TRACE_IO_END(cid);
+#endif
         this->poll_and_complete_io(cid, my_queue_id);
 
         // 1. 获取 Slot 锁
