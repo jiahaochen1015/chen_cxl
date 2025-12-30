@@ -141,8 +141,8 @@ static std::atomic<uint64_t> global_dropped_prefetch_count(0);
 // #define NUM_NVME_QUEUES 4
 // #define HOST_QUEUE_NUM_ENTRIES 2048
 // #define SPIN_COUNT_THRESHOLD 16384
-#define GPU_RW_SIZE_DEMAND (16ULL << 10)
-#define GPU_RW_SIZE_PREFETCH (2048ULL << 10)
+#define GPU_RW_SIZE_DEMAND (8ULL << 10)
+#define GPU_RW_SIZE_PREFETCH (256ULL << 10)
 #define GPU_RW_SIZE GPU_RW_SIZE_DEMAND
 
 // chenjiahao 主机端内存容量
@@ -3957,6 +3957,7 @@ void HostCache::handleRequest(int queue_index)
         // 轮询bid
         uint64_t _bid_first = bid.load(simt::memory_order_relaxed) % HOST_MEM_NUM_PAGES;
         uint64_t _bid = _bid_first;
+        bool has_smart_lock = false;
 
         // TODO:
         //  如果这时候主机端处理的请求大于256，则直接返回失败，防止主机端压力过大
@@ -3971,6 +3972,7 @@ void HostCache::handleRequest(int queue_index)
 #if SMART_SCAN
         if (this->allocate_slot_smart(_bid))
         {
+            has_smart_lock = true;
             // Check if we are evicting a VALID page
             if (host_cache_state[_bid].state.load(simt::memory_order_relaxed) == HOST_CACHE_ENTRY_VALID)
             {
@@ -3984,6 +3986,11 @@ void HostCache::handleRequest(int queue_index)
                 }
 #endif
             }
+        }
+        else
+        {
+            this->host_rw_queue->entries[queue_index].u.CacheReq.return_code = HOST_CACHE_EVICT_FAILED;
+            goto req_ready;
         }
 #else
         // TODO
@@ -4017,95 +4024,115 @@ void HostCache::handleRequest(int queue_index)
         // TODO: 这里的顺序有区别吗
         this->host_rw_queue->entries[queue_index].bid = _bid;
         // Update cache slot state
-        uint32_t lock = host_cache_state[_bid].lock.load(simt::std::memory_order_relaxed);
-        if (lock == HOST_CACHE_ENTRY_UNLOCKED)
+        bool ready_to_evict = false;
+
+        if (has_smart_lock)
         {
-            lock = host_cache_state[_bid].lock.exchange(HOST_CACHE_ENTRY_LOCKED, simt::std::memory_order_acquire);
-            if (lock == HOST_CACHE_ENTRY_UNLOCKED && !IS_PINNED(host_cache_state[_bid]))
+            ready_to_evict = true;
+        }
+        else
+        {
+            uint32_t lock = host_cache_state[_bid].lock.load(simt::std::memory_order_relaxed);
+            if (lock == HOST_CACHE_ENTRY_UNLOCKED)
             {
-                // 必须再次检查，防止在 do-while 和 lock 之间发生竞态
-                if (host_cache_state[_bid].state.load(simt::std::memory_order_relaxed) == HOST_CACHE_ENTRY_PREFETCHING)
-                {
-                    host_cache_state[_bid].lock.exchange(HOST_CACHE_ENTRY_UNLOCKED, simt::std::memory_order_release);
-                    this->host_rw_queue->entries[queue_index].u.CacheReq.return_code = HOST_CACHE_EVICT_FAILED;
-                    goto req_ready; // 安全退出，避免数据损坏
+                lock = host_cache_state[_bid].lock.exchange(HOST_CACHE_ENTRY_LOCKED, simt::std::memory_order_acquire);
+                if (lock == HOST_CACHE_ENTRY_UNLOCKED)
+                {   
+                    if(!IS_PINNED(host_cache_state[_bid]) )
+                    {
+                    // 防御性编程
+                    if (host_cache_state[_bid].state.load(simt::std::memory_order_relaxed) == HOST_CACHE_ENTRY_PREFETCHING)
+                    {
+                        host_cache_state[_bid].lock.exchange(HOST_CACHE_ENTRY_UNLOCKED, simt::std::memory_order_release);
+                        this->host_rw_queue->entries[queue_index].u.CacheReq.return_code = HOST_CACHE_EVICT_FAILED;
+                        goto req_ready; // 安全退出，避免数据损坏
+                    }
+
+                    ready_to_evict = true;
+                    }
+                    else
+                    {
+                        // 被pin住了，不能驱逐
+                        host_cache_state[_bid].lock.store(HOST_CACHE_ENTRY_UNLOCKED, simt::std::memory_order_release);
+                    }
                 }
+            }
+
+            if (!ready_to_evict)
+            {
+                this->host_rw_queue->entries[queue_index].u.CacheReq.return_code = HOST_CACHE_EVICT_FAILED;
+                goto req_ready;
+            }
+     }
+
+        if (ready_to_evict)
+        {
 
 /* Start to transfer data from GPU */
 // fprintf(stderr, "evict to host: start transfer for key %lu\n", key);
 #if MULTI_DATA_STREAM
-                cudaMemcpyAsync((void *)NVM_PTR_OFFSET(host_mem, PAGE_SIZE, _bid), (const void *)gpu_addr, PAGE_SIZE, cudaMemcpyDeviceToHost, stream_mngr->data_stream_from_device[queue_index % NUM_DATA_STREAMS]);
-                cudaStreamSynchronize(stream_mngr->data_stream_from_device[queue_index % NUM_DATA_STREAMS]);
+            cudaMemcpyAsync((void *)NVM_PTR_OFFSET(host_mem, PAGE_SIZE, _bid), (const void *)gpu_addr, PAGE_SIZE, cudaMemcpyDeviceToHost, stream_mngr->data_stream_from_device[queue_index % NUM_DATA_STREAMS]);
+            cudaStreamSynchronize(stream_mngr->data_stream_from_device[queue_index % NUM_DATA_STREAMS]);
 #else
-                // fprintf(stderr, "evict to host: start transfer from device %p to host %p for key %lu done (dirty? %u) (bid %lu)\n", (void*)NVM_PTR_OFFSET(host_mem, PAGE_SIZE, _bid), (const void*)gpu_addr, key, is_dirty, _bid);
-                // unsigned char* test_p = (unsigned char*)NVM_PTR_OFFSET(host_mem, PAGE_SIZE, _bid);
-                // fprintf(stderr, "test_p %p (host_mem %p)\n", test_p, host_mem);
-                // test_p[0] = 'c';
+            // fprintf(stderr, "evict to host: start transfer from device %p to host %p for key %lu done (dirty? %u) (bid %lu)\n", (void*)NVM_PTR_OFFSET(host_mem, PAGE_SIZE, _bid), (const void*)gpu_addr, key, is_dirty, _bid);
+            // unsigned char* test_p = (unsigned char*)NVM_PTR_OFFSET(host_mem, PAGE_SIZE, _bid);
+            // fprintf(stderr, "test_p %p (host_mem %p)\n", test_p, host_mem);
+            // test_p[0] = 'c';
 
-                // fprintf(stderr, "from dev %p begin (bid %lu)\n", gpu_addr, _bid);
-                cudaMemcpyAsync((void *)NVM_PTR_OFFSET(host_mem, PAGE_SIZE, _bid), (const void *)gpu_addr, PAGE_SIZE, cudaMemcpyDeviceToHost, stream_mngr->data_stream_from_device);
-                cudaStreamSynchronize(stream_mngr->data_stream_from_device);
-                // fprintf(stderr, "from dev %p end (bid %lu)\n", gpu_addr, _bid);
+            // fprintf(stderr, "from dev %p begin (bid %lu)\n", gpu_addr, _bid);
+            cudaMemcpyAsync((void *)NVM_PTR_OFFSET(host_mem, PAGE_SIZE, _bid), (const void *)gpu_addr, PAGE_SIZE, cudaMemcpyDeviceToHost, stream_mngr->data_stream_from_device);
+            cudaStreamSynchronize(stream_mngr->data_stream_from_device);
+            // fprintf(stderr, "from dev %p end (bid %lu)\n", gpu_addr, _bid);
 
 #endif
-                // fprintf(stderr, "evict to host: start transfer for key %lu done (dirty? %u)\n", key, is_dirty);
-                /* Update cache state */
-                host_cache_state[_bid].state.store(HOST_CACHE_ENTRY_VALID, simt::std::memory_order_relaxed);
-                host_cache_state[_bid].gpu_addr = (void *)gpu_addr;
-                host_cache_state[_bid].tag = key;
-                host_cache_state[_bid].is_dirty = is_dirty;
+            // fprintf(stderr, "evict to host: start transfer for key %lu done (dirty? %u)\n", key, is_dirty);
+            /* Update cache state */
+            host_cache_state[_bid].state.store(HOST_CACHE_ENTRY_VALID, simt::std::memory_order_relaxed);
+            host_cache_state[_bid].gpu_addr = (void *)gpu_addr;
+            host_cache_state[_bid].tag = key;
+            host_cache_state[_bid].is_dirty = is_dirty;
 #if USE_PREFETCH
-                {
-                    uint32_t new_shard_idx = get_t2_shard_idx(key);
-                    std::lock_guard<std::mutex> lock(t2_map_mutexes[new_shard_idx]);
-                    t2_key_to_bid_maps[new_shard_idx][key] = _bid; // 添加新条目
-                }
+            {
+                uint32_t new_shard_idx = get_t2_shard_idx(key);
+                std::lock_guard<std::mutex> lock(t2_map_mutexes[new_shard_idx]);
+                t2_key_to_bid_maps[new_shard_idx][key] = _bid; // 添加新条目
+            }
 
-                this->host_rw_queue->entries[queue_index].bid = _bid;
+            this->host_rw_queue->entries[queue_index].bid = _bid;
 #endif
-                // printf("evict to host: is_dirty? %u\n", is_dirty);
-                this->host_rw_queue->entries[queue_index].u.CacheReq.return_code = HOST_CACHE_SUCCEEDED;
+            // printf("evict to host: is_dirty? %u\n", is_dirty);
+            this->host_rw_queue->entries[queue_index].u.CacheReq.return_code = HOST_CACHE_SUCCEEDED;
 
-                // flush to ssd before releasing lock
+            // flush to ssd before releasing lock
 #if USER_SPACE_ZERO_COPY
-                // fprintf(stderr, "write data to ssd... %lu begin\n", _bid);
-                // write_data_from_hc(this, _bid*PAGE_SIZE/512, PAGE_SIZE/512, _bid);
-                // fprintf(stderr, "write data to ssd... %lu end\n", _bid);
+            // fprintf(stderr, "write data to ssd... %lu begin\n", _bid);
+            // write_data_from_hc(this, _bid*PAGE_SIZE/512, PAGE_SIZE/512, _bid);
+            // fprintf(stderr, "write data to ssd... %lu end\n", _bid);
 #endif
-                // this->host_rw_queue->entries[queue_index].u.CacheReq.return_code = HOST_CACHE_SUCCEEDED;
-                host_cache_state[_bid].lock.exchange(HOST_CACHE_ENTRY_UNLOCKED, simt::std::memory_order_release);
+            // this->host_rw_queue->entries[queue_index].u.CacheReq.return_code = HOST_CACHE_SUCCEEDED;
+            host_cache_state[_bid].lock.exchange(HOST_CACHE_ENTRY_UNLOCKED, simt::std::memory_order_release);
 
 #if USE_PINNED_MEM
 // if (pin_on_host) {
 //     host_cache_state[_bid].is_pinned = true;
 // }
 #endif
-                // fprintf(stderr, "Evict to host - 1: %lu succeded (bid %lu)\n", key, _bid);
-                valid_entry_count.fetch_add((uint64_t)1, std::memory_order_acquire);
-                __atomic_sub_fetch(num_idle_slots_h, 1, __ATOMIC_SEQ_CST);
+            // fprintf(stderr, "Evict to host - 1: %lu succeded (bid %lu)\n", key, _bid);
+            valid_entry_count.fetch_add((uint64_t)1, std::memory_order_acquire);
+            __atomic_sub_fetch(num_idle_slots_h, 1, __ATOMIC_SEQ_CST);
 
-                if (is_dirty)
-                {
-                    total_tier1_dirty_evicts.fetch_add(1, std::memory_order_seq_cst);
-                }
-                else
-                {
-                    total_tier1_clean_evicts.fetch_add(1, std::memory_order_seq_cst);
-                }
+            if (is_dirty)
+            {
+                total_tier1_dirty_evicts.fetch_add(1, std::memory_order_seq_cst);
             }
             else
             {
-                this->host_rw_queue->entries[queue_index].u.CacheReq.return_code = HOST_CACHE_EVICT_FAILED;
-                // fprintf(stderr, "Evict to host - 2: %lu failed\n", key);
+                total_tier1_clean_evicts.fetch_add(1, std::memory_order_seq_cst);
             }
-        }
-        else
-        {
-            this->host_rw_queue->entries[queue_index].u.CacheReq.return_code = HOST_CACHE_EVICT_FAILED;
-            // fprintf(stderr, "Evict to host: %lu failed\n", key);
         }
         total_tier1_evicts.fetch_add(1, std::memory_order_seq_cst);
     }
+
     else if (type == GPU_RW_EVICT_TO_HOST_ASYNC)
     {
         uint64_t tag = this->host_rw_queue->entries[queue_index].u.ReplicationReq.tag;
@@ -4223,8 +4250,8 @@ void HostCache::handleRequest(int queue_index)
                 goto unpin_done;
             }
 #endif // SMART_SCAN
-            // 072223
-            //__atomic_add_fetch(num_idle_slots_h, 1, __ATOMIC_SEQ_CST);
+       // 072223
+       //__atomic_add_fetch(num_idle_slots_h, 1, __ATOMIC_SEQ_CST);
         }
 
         locked = host_cache_state[_bid].lock.exchange(HOST_CACHE_ENTRY_UNLOCKED, simt::std::memory_order_release);
