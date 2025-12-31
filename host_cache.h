@@ -127,7 +127,7 @@ static std::atomic<uint64_t> global_dropped_prefetch_count(0);
 /*预取相关宏*/
 // 预取功能开关：设置为 1 启用预取，设置为 0 禁用预取
 #define USE_PREFETCH 1
-#define PROFILE_PREFETCH 0
+#define PROFILE_PREFETCH 1
 #define PREFETCH_DEBUG 1
 #define SMART_SCAN 1
 // // 定义并发预取 I/O 的*提交*线程数量
@@ -1904,7 +1904,7 @@ inline uint16_t HostCache::submit_read_data_to_hc_async_st(const uint64_t starti
 {
 #if PROFILE_PREFETCH
     // [NSYS] 标记 IO 提交过程 (构建命令 + 写寄存器)
-    PROFILE_SCOPE("IO::Submit_Routine", GMT_Color::IO_SUBMIT);
+    PROFILE_SCOPE("IO::Submit_Overhead", GMT_Color::IO_SUBMIT);
 #endif
 
     // 1. 获取 CID (无锁，Thread-Local 优化)
@@ -1916,11 +1916,8 @@ inline uint16_t HostCache::submit_read_data_to_hc_async_st(const uint64_t starti
         return 0xFFFF;
 
 #if PROFILE_PREFETCH
-    // =========================================================
-    // [NSYS 关键] 开启异步追踪：SSD 物理读取开始
-    // =========================================================
-    TRACE_IO_START("NVMe_Read_SSD", cid);
-    // =========================================================
+    // 硬件io耗时
+    TRACE_IO_START("NVMe_Read_SSD", cid, queue_id);
 #endif
 
     // 2. 构建命令
@@ -1936,6 +1933,9 @@ inline uint16_t HostCache::submit_read_data_to_hc_async_st(const uint64_t starti
 
     if (tail == 0xFFFF)
     {
+#if PROFILE_PREFETCH
+        TRACE_IO_END(cid, queue_id);
+#endif
         // 队列满，回退 CID
         put_cid_st(&(this->sq_host[queue_id]), cid);
         return 0xFFFF;
@@ -3954,6 +3954,10 @@ void HostCache::handleRequest(int queue_index)
 
     if (type == GPU_RW_EVICT_TO_HOST)
     {
+#if PROFILE_PREFETCH
+        // [Profile] 标记这是一个驱逐操作，如果它很长，说明 T2 抖动剧烈
+        PROFILE_SCOPE("Demand::Evict_Routine", GMT_Color::EVICT_SCAN);
+#endif
         // 轮询bid
         uint64_t _bid_first = bid.load(simt::memory_order_relaxed) % HOST_MEM_NUM_PAGES;
         uint64_t _bid = _bid_first;
@@ -4037,18 +4041,18 @@ void HostCache::handleRequest(int queue_index)
             {
                 lock = host_cache_state[_bid].lock.exchange(HOST_CACHE_ENTRY_LOCKED, simt::std::memory_order_acquire);
                 if (lock == HOST_CACHE_ENTRY_UNLOCKED)
-                {   
-                    if(!IS_PINNED(host_cache_state[_bid]) )
+                {
+                    if (!IS_PINNED(host_cache_state[_bid]))
                     {
-                    // 防御性编程
-                    if (host_cache_state[_bid].state.load(simt::std::memory_order_relaxed) == HOST_CACHE_ENTRY_PREFETCHING)
-                    {
-                        host_cache_state[_bid].lock.exchange(HOST_CACHE_ENTRY_UNLOCKED, simt::std::memory_order_release);
-                        this->host_rw_queue->entries[queue_index].u.CacheReq.return_code = HOST_CACHE_EVICT_FAILED;
-                        goto req_ready; // 安全退出，避免数据损坏
-                    }
+                        // 防御性编程
+                        if (host_cache_state[_bid].state.load(simt::std::memory_order_relaxed) == HOST_CACHE_ENTRY_PREFETCHING)
+                        {
+                            host_cache_state[_bid].lock.exchange(HOST_CACHE_ENTRY_UNLOCKED, simt::std::memory_order_release);
+                            this->host_rw_queue->entries[queue_index].u.CacheReq.return_code = HOST_CACHE_EVICT_FAILED;
+                            goto req_ready; // 安全退出，避免数据损坏
+                        }
 
-                    ready_to_evict = true;
+                        ready_to_evict = true;
                     }
                     else
                     {
@@ -4063,7 +4067,7 @@ void HostCache::handleRequest(int queue_index)
                 this->host_rw_queue->entries[queue_index].u.CacheReq.return_code = HOST_CACHE_EVICT_FAILED;
                 goto req_ready;
             }
-     }
+        }
 
         if (ready_to_evict)
         {
@@ -4958,8 +4962,8 @@ void HostCache::prefetchLoop(uint64_t worker_id)
         if (q_entries[queue_index].status == GPU_RW_PENDING)
         {
 #if PROFILE_PREFETCH
-            // [NSYS] 处理一个预取请求
-            PROFILE_SCOPE("Prefetch::Process_Req", GMT_Color::PREFETCH_PROCESS);
+            // [NSYS] 处理一个预取请求的耗时
+            PROFILE_SCOPE("Prefetch::Handle_Req", GMT_Color::PRE_LOGIC);
 #endif
 
             // 移除 global_prefetch_qid CAS 抢占逻辑
@@ -4972,11 +4976,11 @@ void HostCache::prefetchLoop(uint64_t worker_id)
             uint64_t key = q_entries[queue_index].key;
             bool already_in_t2 = false;
 
-            // --- 逻辑块：检查 T2 是否已存在 (保持原逻辑，因为 T2 Map 是共享的，锁必须保留) ---
+            // --- 检查 T2 是否已存在 ---
             {
 #if PROFILE_PREFETCH
-                // [NSYS] 查表检查 (T2 Check)
-                PROFILE_SCOPE("Prefetch::Map_Lookup", GMT_Color::PREFETCH_LOCK);
+                // Map锁和查找时间
+                PROFILE_SCOPE("Prefetch::Map_Check", GMT_Color::PRE_MAP_CHK);
 #endif
                 uint32_t shard_idx = get_t2_shard_idx(key);
                 std::lock_guard<std::mutex> lock(t2_map_mutexes[shard_idx]);
@@ -5012,79 +5016,86 @@ void HostCache::prefetchLoop(uint64_t worker_id)
             }
             else
             {
-
-#if SMART_SCAN
                 uint64_t _bid;
-                bool found_slot = this->allocate_slot_smart(_bid);
-                bool replaced_invalid_slot = false;
-
-#else
-                // --- 逻辑块：寻找 T2 槽位 (保持原逻辑) ---
-                // 注意：这里仍然使用全局 bid.fetch_add，若追求极致性能，T2 内存池也应该分片，但目前先保持兼容
-                uint64_t _bid = bid.fetch_add(1, simt::memory_order_relaxed) % HOST_MEM_NUM_PAGES;
-                uint64_t start_bid = _bid;
                 bool found_slot = false;
                 bool replaced_invalid_slot = false;
-
-                // [阶段 1: 找 INVALID]
-                do
                 {
-                    if (host_cache_state[_bid].state.load(simt::std::memory_order_relaxed) == HOST_CACHE_ENTRY_INVALID)
+#if PROFILE_PREFETCH
+                    // [Profile] 测量分配策略耗时
+                    PROFILE_SCOPE("Prefetch::Alloc_Slot", GMT_Color::PRE_ALLOC);
+#endif
+#if SMART_SCAN
+                    found_slot = this->allocate_slot_smart(_bid);
+                    replaced_invalid_slot = false;
+
+#else
+                    // --- 逻辑块：寻找 T2 槽位 (保持原逻辑) ---
+                    // 注意：这里仍然使用全局 bid.fetch_add，若追求极致性能，T2 内存池也应该分片，但目前先保持兼容
+                    _bid = bid.fetch_add(1, simt::memory_order_relaxed) % HOST_MEM_NUM_PAGES;
+                    uint64_t start_bid = _bid;
+                    found_slot = false;
+                    replaced_invalid_slot = false;
+
+                    // [阶段 1: 找 INVALID]
+                    do
                     {
-                        if (host_cache_state[_bid].lock.exchange(HOST_CACHE_ENTRY_LOCKED, simt::std::memory_order_acquire) == HOST_CACHE_ENTRY_UNLOCKED)
+                        if (host_cache_state[_bid].state.load(simt::std::memory_order_relaxed) == HOST_CACHE_ENTRY_INVALID)
                         {
-                            if (host_cache_state[_bid].state.load(simt::std::memory_order_relaxed) == HOST_CACHE_ENTRY_INVALID)
+                            if (host_cache_state[_bid].lock.exchange(HOST_CACHE_ENTRY_LOCKED, simt::std::memory_order_acquire) == HOST_CACHE_ENTRY_UNLOCKED)
+                            {
+                                if (host_cache_state[_bid].state.load(simt::std::memory_order_relaxed) == HOST_CACHE_ENTRY_INVALID)
+                                {
+                                    found_slot = true;
+                                    replaced_invalid_slot = true;
+                                    {
+                                        uint32_t shard_idx = get_t2_shard_idx(key);
+                                        std::lock_guard<std::mutex> lock(t2_map_mutexes[shard_idx]);
+                                        t2_key_to_bid_maps[shard_idx][key] = _bid;
+                                    }
+                                    break;
+                                }
+                                else
+                                {
+                                    host_cache_state[_bid].lock.store(HOST_CACHE_ENTRY_UNLOCKED, simt::std::memory_order_release);
+                                }
+                            }
+                        }
+                        _bid = (_bid + 1) % HOST_MEM_NUM_PAGES;
+                    } while (_bid != start_bid);
+
+                    // [阶段 2: 找 Clean/Evict]
+                    if (!found_slot)
+                    {
+                        _bid = start_bid;
+                        do
+                        {
+                            if (host_cache_state[_bid].state.load(simt::memory_order_acquire) == HOST_CACHE_ENTRY_VALID &&
+                                !host_cache_state[_bid].is_dirty &&
+                                !IS_PINNED(host_cache_state[_bid]) &&
+                                host_cache_state[_bid].lock.exchange(HOST_CACHE_ENTRY_LOCKED, simt::std::memory_order_acquire) == HOST_CACHE_ENTRY_UNLOCKED)
                             {
                                 found_slot = true;
-                                replaced_invalid_slot = true;
+                                replaced_invalid_slot = false;
+
+                                // 更新 Map
+                                uint64_t old_key = host_cache_state[_bid].tag;
+                                uint32_t old_shard_idx = get_t2_shard_idx(old_key);
+                                uint32_t new_shard_idx = get_t2_shard_idx(key);
                                 {
-                                    uint32_t shard_idx = get_t2_shard_idx(key);
-                                    std::lock_guard<std::mutex> lock(t2_map_mutexes[shard_idx]);
-                                    t2_key_to_bid_maps[shard_idx][key] = _bid;
+                                    std::lock_guard<std::mutex> lock(t2_map_mutexes[old_shard_idx]);
+                                    t2_key_to_bid_maps[old_shard_idx].erase(old_key);
+                                }
+                                {
+                                    std::lock_guard<std::mutex> lock(t2_map_mutexes[new_shard_idx]);
+                                    t2_key_to_bid_maps[new_shard_idx][key] = _bid;
                                 }
                                 break;
                             }
-                            else
-                            {
-                                host_cache_state[_bid].lock.store(HOST_CACHE_ENTRY_UNLOCKED, simt::std::memory_order_release);
-                            }
-                        }
+                            _bid = (_bid + 1) % HOST_MEM_NUM_PAGES;
+                        } while (_bid != start_bid); // 只在t2里扫一遍
                     }
-                    _bid = (_bid + 1) % HOST_MEM_NUM_PAGES;
-                } while (_bid != start_bid);
-
-                // [阶段 2: 找 Clean/Evict]
-                if (!found_slot)
-                {
-                    _bid = start_bid;
-                    do
-                    {
-                        if (host_cache_state[_bid].state.load(simt::memory_order_acquire) == HOST_CACHE_ENTRY_VALID &&
-                            !host_cache_state[_bid].is_dirty &&
-                            !IS_PINNED(host_cache_state[_bid]) &&
-                            host_cache_state[_bid].lock.exchange(HOST_CACHE_ENTRY_LOCKED, simt::std::memory_order_acquire) == HOST_CACHE_ENTRY_UNLOCKED)
-                        {
-                            found_slot = true;
-                            replaced_invalid_slot = false;
-
-                            // 更新 Map
-                            uint64_t old_key = host_cache_state[_bid].tag;
-                            uint32_t old_shard_idx = get_t2_shard_idx(old_key);
-                            uint32_t new_shard_idx = get_t2_shard_idx(key);
-                            {
-                                std::lock_guard<std::mutex> lock(t2_map_mutexes[old_shard_idx]);
-                                t2_key_to_bid_maps[old_shard_idx].erase(old_key);
-                            }
-                            {
-                                std::lock_guard<std::mutex> lock(t2_map_mutexes[new_shard_idx]);
-                                t2_key_to_bid_maps[new_shard_idx][key] = _bid;
-                            }
-                            break;
-                        }
-                        _bid = (_bid + 1) % HOST_MEM_NUM_PAGES;
-                    } while (_bid != start_bid); // 只在t2里扫一遍
-                }
 #endif // SMART_SCAN
+                }
 
                 // --- 逻辑块：提交 I/O (核心修改部分) ---
                 if (found_slot)
@@ -5490,42 +5501,70 @@ void HostCache::completionLoop(uint64_t worker_id)
         {
             continue;
         }
+
+        {
 #if PROFILE_PREFETCH
-        TRACE_IO_END(cid);
+            // [Profile] 测量 CPU 空转等待 SSD 的时间 (Pure IO Wait)
+            PROFILE_SCOPE("Complete::Poll_Wait", GMT_Color::IO_POLL);
 #endif
-        this->poll_and_complete_io(cid, my_queue_id);
-
-        // 1. 获取 Slot 锁
-        while (host_cache_state[info.bid].lock.exchange(
-                   HOST_CACHE_ENTRY_LOCKED,
-                   simt::memory_order_acquire) != HOST_CACHE_ENTRY_UNLOCKED)
-        {
-            // _mm_pause(); // 如果不想引入 SIMD 指令头文件，可以用空循环
+            this->poll_and_complete_io(cid, my_queue_id);
         }
 
-        // 2. Double Check
-        if (host_cache_state[info.bid].state.load(simt::memory_order_relaxed) == HOST_CACHE_ENTRY_PREFETCHING &&
-            host_cache_state[info.bid].tag == info.key)
-        {
-            // Mark Valid
-            host_cache_state[info.bid].is_dirty = false;
-            host_cache_state[info.bid].state.store(HOST_CACHE_ENTRY_VALID, simt::memory_order_release);
+#if PROFILE_PREFETCH
+        // [Profile] 硬件 I/O 结束 (End)
+        TRACE_IO_END(cid, my_queue_id);
+#endif
 
-            // Stats
-            if (info.replaced_invalid_slot)
+        // 软件后处理阶段
+        {
+#if PROFILE_PREFETCH
+            // [Profile] 测量软件后处理总时间
+            PROFILE_SCOPE("Complete::Post_Process", GMT_Color::CMPL_PROCESS);
+#endif
+            // 1. 获取 Slot 锁
             {
-                valid_entry_count.fetch_add(1, std::memory_order_relaxed);
-                __atomic_sub_fetch(num_idle_slots_h, 1, __ATOMIC_SEQ_CST);
+#if PROFILE_PREFETCH
+                // [Profile] 测量锁竞争时间 (如果有红色长条，说明与 Demand 冲突严重)
+                PROFILE_SCOPE("Lock::Spin", GMT_Color::LOCK_SPIN);
+#endif
+                while (host_cache_state[info.bid].lock.exchange(
+                           HOST_CACHE_ENTRY_LOCKED,
+                           simt::memory_order_acquire) != HOST_CACHE_ENTRY_UNLOCKED)
+                {
+                    _mm_pause(); // 如果不想引入 SIMD 指令头文件，可以用空循环
+                }
             }
+
+            // 2. Double Check
+            {
+#if PROFILE_PREFETCH
+                // [Profile] 测量元数据更新时间 (通常很短)
+                PROFILE_SCOPE("State::Update", GMT_Color::STATE_UPDATE);
+#endif
+                if (host_cache_state[info.bid].state.load(simt::memory_order_relaxed) == HOST_CACHE_ENTRY_PREFETCHING &&
+                    host_cache_state[info.bid].tag == info.key)
+                {
+                    // Mark Valid
+                    host_cache_state[info.bid].is_dirty = false;
+                    host_cache_state[info.bid].state.store(HOST_CACHE_ENTRY_VALID, simt::memory_order_release);
+
+                    // Stats
+                    if (info.replaced_invalid_slot)
+                    {
+                        valid_entry_count.fetch_add(1, std::memory_order_relaxed);
+                        __atomic_sub_fetch(num_idle_slots_h, 1, __ATOMIC_SEQ_CST);
+                    }
+                }
+
+                // 3. 释放锁
+                host_cache_state[info.bid].lock.store(HOST_CACHE_ENTRY_UNLOCKED, simt::memory_order_release);
+            }
+
+            // 通知 GPU
+            this->host_rw_queue_prefetch->entries[info.queue_index].status = GPU_RW_EMPTY;
+            this->host_rw_manager_prefetch->entry_lock[info.queue_index] = GPU_NO_LOCKED;
+            __sync_synchronize();
         }
-
-        // 3. 释放锁
-        host_cache_state[info.bid].lock.store(HOST_CACHE_ENTRY_UNLOCKED, simt::memory_order_release);
-
-        // 通知 GPU
-        this->host_rw_queue_prefetch->entries[info.queue_index].status = GPU_RW_EMPTY;
-        this->host_rw_manager_prefetch->entry_lock[info.queue_index] = GPU_NO_LOCKED;
-        __sync_synchronize();
     } // end while
 }
 
